@@ -3,6 +3,7 @@ import meshpy as mp
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from numpy.polynomial.legendre import leggauss
 
 
 #%%
@@ -75,9 +76,26 @@ class FiniteElement:
         self.mesh_elements = np.array(self.mesh.elements, dtype=float)
         
         self.num_nodes = self.nodes.shape[0]
-    
-    
         
+    def _shape_funcs(self, xi, eta):
+        """
+        Calculate the shape functions and their derivatives
+
+        Args:
+            xi (float): xi coordinate
+            eta (float): eta coordinate
+
+        Returns:
+            N (np.array): Shape functions
+            dN (np.array): Derivatives of shape functions
+        """
+        
+        N = np.array([1-xi-eta, xi, eta])
+        dN = np.array([[-1, -1], [1, 0], [0, 1]])
+
+        return N, dN
+    
+    def _get_dunavant_quadrature(self, order=1):
     
 #%%
 
