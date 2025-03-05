@@ -13,14 +13,37 @@ class Dunavant:
     
     """
     A class that encapsulates the Dunavant quadrature rule for the reference triangle.
+    Modified from C++ code by John Burkardt.
+    
+    Author : Gianluca Seaford
+    Date   : 2021-03-16
+    
+    Reference:
+
+        David Dunavant,
+        High Degree Efficient Symmetrical Gaussian Quadrature Rules
+        for the Triangle,
+        International Journal for Numerical Methods in Engineering,
+        Volume 21, 1985, pages 1129-1148.
+
+        James Lyness, Dennis Jespersen,
+        Moderate Degree Symmetric Quadrature Rules for the Triangle,
+        Journal of the Institute of Mathematics and its Applications,
+        Volume 15, Number 1, February 1975, pages 19-32.
+        
+        John Burkardt,
+        triangle_dunavant_rule.cpp
+        https://people.sc.fsu.edu/~jburkardt/cpp_src/triangle_dunavant_rule/triangle_dunavant_rule.html
+        Accessed 2021-03-16.
+        
     
     Attributes:
-      rule      : integer, the chosen rule (from 1 to 20)
-      degree    : polynomial degree of exactness (here taken equal to the rule number)
-      order     : total number of quadrature points (computed from the suborder data)
-      points    : NumPy array of shape (order, 2) with the quadrature points (in barycentric coordinates,
+        rule      : integer, the chosen rule (from 1 to 20)
+        degree    : polynomial degree of exactness (here taken equal to the rule number)
+        order     : total number of quadrature points (computed from the suborder data)
+        points    : NumPy array of shape (order, 2) with the quadrature points (in barycentric coordinates,
                   where we interpret the first two coordinates as the x and y of the point)
-      weights   : NumPy array of length order containing the quadrature weights.
+        weights   : NumPy array of length order containing the quadrature weights.
       
     """
     
@@ -319,7 +342,7 @@ class Dunavant:
         Initialise Dunavant quadrature rule.
         
         Args:
-          rule (int): The rule index (must be between 1 and 20).
+          rule (int): Rule index (must be between 1 and 20).
         """
         if not (1 <= rule <= 20):
             raise ValueError(f"Rule must be between 1 and 20; got {rule}.")
@@ -475,12 +498,233 @@ class FiniteElement:
         """
         
         N = np.array([1-xi-eta, xi, eta])
+        
         dN = np.array([[-1, -1], [1, 0], [0, 1]])
 
         return N, dN
     
-
+    def _constitutive_matrix(self):
+        """
+        Compute the constitutive matrix D for plane stress.
+        
+        Returns:
+            D (np.array): 3x3 constitutive matrix.
+        """
+        E = self.Youngs_modulus
+        nu = self.Poisson_ratio
+        
+        C = E / (1 - nu**2) * np.array([
+            [1, nu, 0],
+            [nu, 1, 0],
+            [0, 0, (1 - nu)/2]
+        ])
+        return C
     
+    def _apply_tractions(self):
+        """
+        Assemble nodal forces from prescribed traction on edges.
+        """
+        for key, tr in self.tractions.items():
+            traction = tr['traction']
+            nodes_edge = tr['nodes']
+            n1, n2 = nodes_edge
+            coord1 = self.nodes[n1]
+            coord2 = self.nodes[n2]
+            L = np.linalg.norm(coord2 - coord1)
+
+            F_edge = (L / 2) * traction
+            
+            self.F[2*n1:2*n1+2] += F_edge
+            self.F[2*n2:2*n2+2] += F_edge
+            
+    def _apply_boundary_conditions(self):
+        """
+        Apply essential (Dirichlet) boundary conditions.
+        """
+        fixed_dofs = []
+        tol = 1e-6
+        for i, coord in enumerate(self.nodes):
+            if abs(coord[0]) < tol:
+                fixed_dofs.extend([2*i, 2*i+1])
+
+        for dof in fixed_dofs:
+            self.K[dof, :] = 0
+            self.K[:, dof] = 0
+            self.K[dof, dof] = 1
+            self.F[dof] = 0
+    
+    def _assemble_system(self):
+        """
+        Assemble the global stiffness matrix and force vector.
+        """
+        
+        n_dof = 2* self.num_nodes
+        
+        K = sp.lil_matrix((n_dof, n_dof))
+        F = np.zeros(n_dof)
+        C = self._constitutive_matrix()
+        
+        quad = Dunavant(3)
+        
+        for element in self.mesh_elements:
+            n1, n2, n3 = element
+            coords = self.nodes[[n1, n2, n3], :]
+            
+            x1, y1 = coords[0]
+            x2, y2 = coords[1]
+            x3, y3 = coords[2]
+            
+            J = np.array([[x2-x1, x3-x1],[y2-y1, y3-y1]])
+            
+            detJ = np.linalg.det(J)
+            if detJ <= 0:
+                raise ValueError("Non-positive element area encountered.")
+            invJ = np.linalg.inv(J)
+            
+            Ke = np.zeros((6, 6))
+            
+            for qp, w_q in zip(quad.points, quad.weights):
+                xi, eta = qp 
+
+                N, dN_dxi = self._shape_funcs(xi, eta)
+            
+                dN_dx = dN_dxi @ invJ.T
+
+                B = np.zeros((3, 6))
+                for i in range(3):
+                    B[0, 2*i]   = dN_dx[i, 0]
+                    B[1, 2*i+1] = dN_dx[i, 1]
+                    B[2, 2*i]   = dN_dx[i, 1]
+                    B[2, 2*i+1] = dN_dx[i, 0]
+                
+                Ke += (B.T @ C @ B) * detJ * w_q
+            
+            dof_indices = [2*n1, 2*n1+1, 2*n2, 2*n2+1, 2*n3, 2*n3+1]
+            
+            for i in range(6):
+                for j in range(6):
+                    K[dof_indices[i], dof_indices[j]] += Ke[i, j]
+                    
+            self.K = K.tocsr()
+            self.F = F
+            
+            self._apply_tractions()
+            
+            
+    def _solve_system(self):
+        """
+        Solve the linear system for displacements.
+        """
+        self.U = spla.spsolve(self.K, self.F)
+        
+    def _post_process(self):
+        """
+        Compute strains and stresses for each element.
+        """
+        num_elems = self.mesh_elements.shape[0]
+        self.Strain = np.zeros((num_elems, 3))
+        self.Stress = np.zeros((num_elems, 3))
+        D = self._constitutive_matrix()
+        
+        for idx, elem in enumerate(self.mesh_elements):
+            n1, n2, n3 = elem
+            coords = self.nodes[[n1, n2, n3], :]
+            x1, y1 = coords[0]
+            x2, y2 = coords[1]
+            x3, y3 = coords[2]
+            J = np.array([[x2 - x1, x3 - x1],
+                          [y2 - y1, y3 - y1]])
+            detJ = np.linalg.det(J)
+            invJ = np.linalg.inv(J)
+            dN_dxi = np.array([[-1, -1],
+                                [ 1,  0],
+                                [ 0,  1]])
+            dN_dx = dN_dxi @ invJ.T
+            B = np.zeros((3, 6))
+            for i in range(3):
+                B[0, 2*i]   = dN_dx[i, 0]
+                B[1, 2*i+1] = dN_dx[i, 1]
+                B[2, 2*i]   = dN_dx[i, 1]
+                B[2, 2*i+1] = dN_dx[i, 0]
+            dof_indices = [2*n1, 2*n1+1, 2*n2, 2*n2+1, 2*n3, 2*n3+1]
+            Ue = self.U[dof_indices]
+            strain = B @ Ue
+            stress = D @ strain
+            self.Strain[idx, :] = strain
+            self.Stress[idx, :] = stress
+            
+    def _estimate_error(self):
+        """
+        A simple error estimator is computed as the maximum element energy norm.
+        """
+        error_elem = []
+        D = self._constitutive_matrix()
+        for elem in self.mesh_elements:
+            n1, n2, n3 = elem
+            coords = self.nodes[[n1, n2, n3], :]
+            x1, y1 = coords[0]
+            x2, y2 = coords[1]
+            x3, y3 = coords[2]
+            J = np.array([[x2 - x1, x3 - x1],
+                          [y2 - y1, y3 - y1]])
+            detJ = np.linalg.det(J)
+            invJ = np.linalg.inv(J)
+            dN_dxi = np.array([[-1, -1],
+                                [ 1,  0],
+                                [ 0,  1]])
+            dN_dx = dN_dxi @ invJ.T
+            B = np.zeros((3, 6))
+            for i in range(3):
+                B[0, 2*i]   = dN_dx[i, 0]
+                B[1, 2*i+1] = dN_dx[i, 1]
+                B[2, 2*i]   = dN_dx[i, 1]
+                B[2, 2*i+1] = dN_dx[i, 0]
+            dof_indices = [2*n1, 2*n1+1, 2*n2, 2*n2+1, 2*n3, 2*n3+1]
+            Ue = self.U[dof_indices]
+            strain = B @ Ue
+            energy = 0.5 * strain.T @ D @ strain * detJ
+            error_elem.append(np.sqrt(energy))
+        return max(error_elem)
+            
+    def _refine_mesh(self, error_indicator, tolerance):
+        """
+        Refine mesh by reducing the maximum element volume.
+        """
+        print(f"Refining mesh: current max_volume = {self.max_volume}, error indicator = {error_indicator}")
+        self.max_volume *= 0.5
+        self._generate_mesh(max_volume=self.max_volume)
+    
+    def run_analysis(self, tolerance=1e-3, max_iterations=10):
+        """
+        Main driver routine.
+        """
+        iteration = 0
+        converged = False
+
+        self._generate_mesh()
+        
+        while not converged and iteration < max_iterations:
+            print(f"\nIteration {iteration+1}")
+            self._assemble_system()
+            self._apply_boundary_conditions()
+            self._solve_system()
+            self._post_process()
+            
+            error_indicator = self._estimate_error()
+            print(f"Error indicator: {error_indicator:.4e}")
+            
+            if error_indicator < tolerance:
+                converged = True
+                
+            else:
+                self._refine_mesh(error_indicator, tolerance)
+                iteration += 1
+        
+        if converged:
+            print("Convergence achieved.")
+        else:
+            print("Maximum iterations reached without convergence.")
+        
 #%%
 
 E = 4.4e7 # Pa
@@ -518,5 +762,9 @@ tractions = {
         }
     }
 
+fe_solver = FiniteElement()
+fe_solver._set_system_params(domain, tractions, E, nu, thickness)
+
+fe_solver.run_analysis(tolerance=1e-3, max_iterations=10)
 
 # %%
