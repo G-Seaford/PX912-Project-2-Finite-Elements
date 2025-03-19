@@ -509,6 +509,7 @@ class FiniteElement:
             self.F[dof] = 0
     
     
+    
 
 #%%
 
