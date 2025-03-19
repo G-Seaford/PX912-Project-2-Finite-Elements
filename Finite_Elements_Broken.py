@@ -428,7 +428,6 @@ class FiniteElement:
         # Mesh properties        
         self.mesh = None
         self.nodes = None
-        self.num_nodes = None
         self.mesh_elements = None
         self.max_volume = None
         
@@ -448,6 +447,14 @@ class FiniteElement:
         # Stress & Strain History
         self.stress_error_history = []
         self.strain_error_history = []
+        
+    @property
+    def num_nodes(self):
+        return self.nodes.shape[0]
+
+    @property
+    def num_elements(self):
+        return self.mesh_elements.shape[0]
     
     def _set_system_params(self, domain, tractions, E, nu, thickness, init_vol):
         self.domain = domain
@@ -468,7 +475,6 @@ class FiniteElement:
         self.mesh = mp.build(mesh_info, max_volume=max_volume)
         self.nodes = np.array(self.mesh.points)
         self.mesh_elements = np.array(self.mesh.elements, dtype=int)
-        self.num_nodes = self.nodes.shape[0]
     
     def _shape_funcs(self, xi, eta):
         N = np.array([1 - xi - eta, xi, eta])
@@ -775,8 +781,7 @@ class FiniteElement:
                 new_elements.append(list(elem))
         
         self.nodes = np.array(new_nodes)
-        self.mesh_elements = np.array(new_elements, dtype=int)
-        self.num_nodes = self.nodes.shape[0]
+        self.mesh_elements = np.array(new_elements, dtype=int) §
         print(f"Local refinement: now {len(new_elements)} elements, {self.num_nodes} nodes.")
     
     def run_analysis(self, tol_stress=1e-2, tol_strain=1e-2, max_iterations=20):

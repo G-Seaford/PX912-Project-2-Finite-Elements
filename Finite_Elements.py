@@ -441,6 +441,13 @@ class FiniteElement:
         self.Stress = None
         self.Strain = None
         
+        # Reference Solutions
+        self.ref_nodes = None
+        self.ref_mesh_elements = None
+        self.U_ref = None
+        self.Stress_ref = None
+        self.Strain_ref = None
+        
         # Refinement History
         self.num_element_history = []
         self.error_history = []
@@ -457,6 +464,7 @@ class FiniteElement:
         return self.mesh_elements.shape[0]
     
     def _set_system_params(self, domain, tractions, E, nu, thickness, init_vol):
+        
         self.domain = domain
         self.tractions = tractions
         self.Youngs_modulus = E
@@ -465,8 +473,8 @@ class FiniteElement:
         self.max_volume = init_vol
         
     def _generate_mesh(self, max_volume=0.15):
-        vertices = self.domain.get('vertices').tolist()
-        segments = self.domain.get('edges').tolist()
+        vertices = self.domain.get('vertices')
+        segments = self.domain.get('edges')
         mesh_info = mp.MeshInfo()
         mesh_info.set_points(vertices)
         mesh_info.set_facets(segments)
@@ -560,39 +568,387 @@ class FiniteElement:
           - Apply any additional forces.
         """
 
-        # Identify nodes with x coordinate approximately 0.
         fixed_nodes = [i for i, coord in enumerate(self.nodes) if abs(coord[0]) < 1e-8]
         for node in fixed_nodes:
-            # Each node has two degrees of freedom: [2*node, 2*node+1] (x and y)
-            
             for dof in [2 * node, 2 * node + 1]:
-                # Zero out the corresponding row and column in K and set the diagonal to 1.
                 self.K[dof, :] = 0
                 self.K[:, dof] = 0
                 self.K[dof, dof] = 1
                 self.F[dof] = 0
 
-        # Check if there are any traction conditions defined.
-        if hasattr(self, 'tractions') and self.tractions is not None:
-            for bc in self.tractions:
-                # Each traction condition should have an 'edge' and a 'traction' value.
-                n1, n2 = bc['edge']
+        if self.tractions is not None:
+            for key, bc in self.tractions.items():
+                if 'edge' in bc:
+                    nodes_edge = bc['edge']
+                elif 'nodes' in bc:
+                    nodes_edge = bc['nodes']
+                else:
+                    continue
+                n1, n2 = nodes_edge
                 p1 = self.nodes[n1]
                 p2 = self.nodes[n2]
-                # Calculate the length of the edge.
                 L = np.linalg.norm(p2 - p1)
-                # Compute the equivalent nodal force:
-                # For a linear edge, each node gets (L * thickness / 2) * traction.
                 force_contribution = (L * self.plane_thickness / 2) * np.array(bc['traction'])
-                self.F[2 * n1: 2 * n1 + 2] += force_contribution
-                self.F[2 * n2: 2 * n2 + 2] += force_contribution
+                self.F[2*n1:2*n1+2] += force_contribution
+                self.F[2*n2:2*n2+2] += force_contribution
 
-        if hasattr(self, 'forces') and self.forces is not None:
+        if self.forces is not None:
             for force in self.forces:
                 node = force['node']
-                self.F[2 * node: 2 * node + 2] += np.array(force['force'])
+                self.F[2*node:2*node+2] += np.array(force['force'])
                 
+    def solve_system(self):
+        """"
+        Solve the finite element system for nodal displacements.
+        """
+        self.U = np.linalg.solve(self.K, self.F)
+        
+        # K_sparse = csr_matrix(self.K)
+        # self.U = spsolve(K_sparse, self.F)
+        
+    def compute_element_stress_strain(self, elem_idx):
+        """
+        Compute the strain and stress in element elem_idx using the element's nodal displacements.
+        
+        Returns:
+          strain : (3,) array corresponding to [ε_xx, ε_yy, γ_xy]
+          stress : (3,) array computed as D*strain
+        """
+        nodes_idx = self.mesh_elements[elem_idx]
+        coords = self.nodes[nodes_idx, :]
+        
+        # Assemble the local displacement vector U_e.
+        dof_indices = []
+        for n in nodes_idx:
+            dof_indices.extend([2*n, 2*n+1])
+        U_e = self.U[dof_indices]  # shape (6,)
+        
+        # Compute element area and shape function derivatives.
+        x1, y1 = coords[0]
+        x2, y2 = coords[1]
+        x3, y3 = coords[2]
+        detJ = (x2 - x1)*(y3 - y1) - (x3 - x1)*(y2 - y1)
+        A_e = 0.5 * abs(detJ)
+        
+        dN_dx = np.array([y2 - y3, y3 - y1, y1 - y2]) / (2*A_e)
+        dN_dy = np.array([x3 - x2, x1 - x3, x2 - x1]) / (2*A_e)
+        
+        # Build the strain-displacement matrix B.
+        B = np.zeros((3, 6))
+        for i in range(3):
+            B[0, 2*i]   = dN_dx[i]
+            B[1, 2*i+1] = dN_dy[i]
+            B[2, 2*i]   = dN_dy[i]
+            B[2, 2*i+1] = dN_dx[i]
+        
+        strain = B.dot(U_e)
+        stress = self._constitutive_matrix().dot(strain)
+        return strain, stress
     
+    def compute_reference_element_stress_strain(self, elem_idx):
+        
+        nodes_idx = self.ref_mesh_elements[elem_idx]
+        coords = self.ref_nodes[nodes_idx, :]
+        dof_indices = []
+        
+        for n in nodes_idx:
+            dof_indices.extend([2*n, 2*n+1])
+            
+        U_e = self.U_ref[dof_indices]
+        x1, y1 = coords[0]
+        x2, y2 = coords[1]
+        x3, y3 = coords[2]
+        detJ = (x2 - x1)*(y3 - y1) - (x3 - x1)*(y2 - y1)
+        A_e = 0.5 * abs(detJ)
+        
+        dN_dx = np.array([y2 - y3, y3 - y1, y1 - y2]) / (2*A_e)
+        dN_dy = np.array([x3 - x2, x1 - x3, x2 - x1]) / (2*A_e)
+        B = np.zeros((3, 6))
+        
+        for i in range(3):
+            B[0, 2*i]   = dN_dx[i]
+            B[1, 2*i+1] = dN_dy[i]
+            B[2, 2*i]   = dN_dy[i]
+            B[2, 2*i+1] = dN_dx[i]
+            
+        strain = B.dot(U_e)
+        stress = self._constitutive_matrix().dot(strain)
+        
+        return strain, stress
+    
+    def _adaptive_refinement(self, tol=0.01, max_iter=10):
+        """
+        Perform adaptive refinement based on a local L²-type stress error computed via Dunavant quadrature.
+        For each element, the integrated squared difference between the current stress and the reference stress
+        is computed and compared (in a relative sense) to an integrated reference stress.
+        If the relative error exceeds tol, the element's nodes are flagged for refinement.
+        The flagged nodes are added as new vertices, and the mesh is regenerated.
+        """
+        if self.U_ref is None or self.ref_nodes is None or self.ref_mesh_elements is None:
+            print("Reference solution not fully available.")
+            return
+
+        # Build a KD-tree for the reference element centroids and store reference stresses.
+        ref_centroids = []
+        ref_stresses = []
+        for i in range(len(self.ref_mesh_elements)):
+            coords = self.ref_nodes[self.ref_mesh_elements[i]]
+            centroid = np.mean(coords, axis=0)
+            ref_centroids.append(centroid)
+            
+            # For each reference element, compute its stress (assumed constant).
+            _, stress_ref = self.compute_reference_element_stress_strain(i)
+            ref_stresses.append(stress_ref)
+        ref_centroids = np.array(ref_centroids)
+        ref_stresses = np.array(ref_stresses)
+        
+        self.ref_tree = cKDTree(ref_centroids)
+        self.ref_stresses = ref_stresses
+
+        # Choose a Dunavant quadrature rule (e.g. rule 4) for integration.
+        quad = Dunavant(4)
+
+        for iteration in range(max_iter):
+            refinement_points = []
+            element_errors = []
+            
+            for i in range(self.num_elements):
+                integrated_error, integrated_ref_stress, A_e = self._integrated_stress_error(i, quad)
+                
+                # Relative error: integrated error normalized by integrated reference stress.
+                rel_err = integrated_error / (integrated_ref_stress + 1e-8)
+                element_errors.append(rel_err)
+                
+                if rel_err > tol:
+                    # Flag all nodes of this element for refinement.
+                    for n in self.mesh_elements[i]:
+                        refinement_points.append(self.nodes[n].tolist())
+                        
+            max_err = max(element_errors) if element_errors else 0
+            print(f"Adaptive refinement iteration {iteration}: max relative stress error = {max_err:.3e}")
+            
+            if max_err < tol:
+                print("Adaptive refinement converged.")
+                break
+            
+            # Add new vertices from flagged elements.
+            current_vertices = self.domain.get('vertices')
+            new_points = []
+            
+            for pt in refinement_points:
+                # Check if the candidate point pt is sufficiently far from every existing point.
+                if not np.any(np.linalg.norm(current_vertices - np.array(pt), axis=1) < tol):
+                    new_points.append(pt)
+
+            if new_points:  # Only if there are new points, update the vertices.
+                new_points_arr = np.array(new_points)
+                # Vertically stack the new points onto the existing vertices.
+                current_vertices = np.vstack([current_vertices, new_points_arr])
+                self.domain['vertices'] = current_vertices
+
+            # Regenerate the mesh and reassemble.
+            self._generate_mesh(max_volume=self.max_volume)
+            self._assemble_global_stiffness()
+            self.F = np.zeros(2 * self.num_nodes)
+            self._set_boundary_conditions()
+            self.solve_system()
+            self.num_element_history.append(self.num_elements)
+            global_error = np.linalg.norm(self.F - self.K.dot(self.U))
+            self.error_history.append(global_error)
+            
+    def _integrated_stress_error(self, elem_idx, quad_rule):
+        """
+        Compute the integrated L² error in stress for the current element using the provided Dunavant quadrature rule.
+        
+        Returns:
+          integrated_error : integrated error (sqrt of weighted sum of squared error)
+          integrated_ref_stress : similarly integrated reference stress magnitude
+          A_e : area of the current element
+        """
+        
+        nodes_idx = self.mesh_elements[elem_idx]
+        coords = self.nodes[nodes_idx, :]  # shape (3,2)
+        
+        # Compute element area.
+        x1, y1 = coords[0]
+        x2, y2 = coords[1]
+        x3, y3 = coords[2]
+        detJ = (x2 - x1)*(y3 - y1) - (x3 - x1)*(y2 - y1)
+        A_e = 0.5 * abs(detJ)
+        
+        # Get the current element's stress (assumed constant).
+        _, stress_comp = self.compute_element_stress_strain(elem_idx)
+        
+        error_sq = 0.0
+        ref_stress_sq = 0.0
+        
+        # For each quadrature point in the reference triangle:
+        for (xi, eta), w in zip(quad_rule.points, quad_rule.weights):
+            L1 = xi
+            L2 = eta
+            L3 = 1 - xi - eta
+            
+            # Map from reference triangle to physical element.
+            x = L1 * x1 + L2 * x2 + L3 * x3
+            y = L1 * y1 + L2 * y2 + L3 * y3
+            
+            # Query the reference KD-tree to get the reference stress at (x,y).
+            dist, idx = self.ref_tree.query([x, y])
+            stress_ref = self.ref_stresses[idx]
+            err = np.linalg.norm(stress_comp - stress_ref)
+            error_sq += w * err**2
+            ref_stress_sq += w * (np.linalg.norm(stress_ref))**2
+        
+        # The mapping from the reference triangle to the physical element has a constant Jacobian: 2*A_e.
+        integrated_error = np.sqrt(error_sq) * (2 * A_e)
+        integrated_ref_stress = np.sqrt(ref_stress_sq) * (2 * A_e)
+        
+        return integrated_error, integrated_ref_stress, A_e
+            
+    def generate_reference_solution(self, ref_max_volume):
+        """
+        Generate an ultra-fine reference solution.
+        This function creates a mesh with a very small max_volume (ref_max_volume),
+        assembles the system, applies the boundary conditions, and solves for nodal displacements.
+        The reference nodal coordinates and displacement vector are then stored in self.ref_nodes and self.U_ref.
+        """
+        
+        self._generate_mesh(max_volume=ref_max_volume)
+        self._assemble_global_stiffness()
+        
+        self.F = np.zeros(2*self.num_nodes)
+        self._set_boundary_conditions()
+        self.solve_system()
+        
+        self.ref_nodes = self.nodes.copy()
+        self.ref_mesh_elements = self.mesh_elements.copy()
+        self.U_ref = self.U.copy()
+        
+        print(f"Reference solution generated with {self.num_elements} elements.")
+        
+    def run_analysis(self, ref_max_volume=0.01, tol_stress=0.01, max_iterations=10):
+        """
+        Run the system analysis
+        """
+        # Generate the reference solution.
+        self.generate_reference_solution(ref_max_volume)
+        
+        # Generate the initial mesh and solve.
+        self._generate_mesh(max_volume=self.max_volume)
+        self._assemble_global_stiffness()
+        self.F = np.zeros(2 * self.num_nodes)
+        self._set_boundary_conditions()
+        self.solve_system()
+        
+        initial_error = np.linalg.norm(self.F - self.K.dot(self.U))
+        self.error_history.append(initial_error)
+        self.num_element_history.append(self.num_elements)
+        print(f"Initial global error = {initial_error:.3e}, number of elements = {self.num_elements}")
+        
+        #  Adaptive refinement based on local stress error.
+        self._adaptive_refinement(tol=tol_stress, max_iter=max_iterations)
+        
+        # Compute element-level stresses and strains.
+        stresses = []
+        strains = []
+        for i in range(self.num_elements):
+            strain, stress = self.compute_element_stress_strain(i)
+            strains.append(strain)
+            stresses.append(stress)
+        self.Strain = np.array(strains)
+        self.Stress = np.array(stresses)
+            
+    def plot_mesh(self):
+        triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], triangles=self.mesh_elements)
+        plt.figure()
+        plt.triplot(triang, 'k-', lw=0.5)
+        plt.title('Finite Element Mesh')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+    
+    def plot_stress_field(self, component=0):
+        """
+        Plot the stress field using nodal values (recovered by averaging the element stresses)
+        and using Gouraud shading.
+        """
+        dims = ['x','y']
+        
+        # Compute nodal stress values by averaging over all elements sharing a node.
+        num_nodes = self.nodes.shape[0]
+        stress_sum = np.zeros(num_nodes)
+        count = np.zeros(num_nodes)
+        for i, elem in enumerate(self.mesh_elements):
+            for n in elem:
+                stress_sum[n] += self.Stress[i, component]
+                count[n] += 1
+                
+        # Avoid division by zero.
+        nodal_stress = stress_sum / np.maximum(count, 1)
+    
+        triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1],
+                                triangles=self.mesh_elements)
+    
+        plt.figure()
+        # Gouraud shading uses values at vertices.
+        tpc = plt.tripcolor(triang, nodal_stress, edgecolors='k', shading='gouraud')
+        plt.colorbar(tpc, label=f'Stress component (Pa)')
+        plt.title(f'Stress Field in {dims[component]}-direction with Gouraud shading')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+        
+    def plot_strain_field(self, component=0):
+        """
+        Plot the strain field using nodal values (recovered by averaging the element stresses)
+        and using Gouraud shading.
+        """
+        dims = ['x','y']
+        
+        # Compute nodal strain values by averaging over all elements sharing a node.
+        num_nodes = self.nodes.shape[0]
+        strain_sum = np.zeros(num_nodes)
+        count = np.zeros(num_nodes)
+        for i, elem in enumerate(self.mesh_elements):
+            for n in elem:
+                strain_sum[n] += self.Strain[i, component]
+                count[n] += 1
+                
+        # Avoid division by zero.
+        nodal_strain = strain_sum / np.maximum(count, 1)
+    
+        triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1],
+                                triangles=self.mesh_elements)
+    
+        plt.figure()
+        
+        # Gouraud shading uses values at vertices.
+        tpc = plt.tripcolor(triang, nodal_strain, edgecolors='k', shading='gouraud')
+        plt.colorbar(tpc, label=f'Strain component')
+        plt.title(f'Strain Field in {dims[component]}-direction with Gouraud shading')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+        
+    def plot_convergence(self):
+        plt.plot(self.num_element_history, self.error_history, marker='o')
+        plt.xlabel("Number of Elements")
+        plt.ylabel("Global Error")
+        plt.title("Error Convergence")
+        plt.show()
+        
+    def plot_data(self):
+        
+        self.plot_mesh()
+        
+        self.plot_convergence()
+        
+        self.plot_stress_field(component=0)
+        self.plot_stress_field(component=1)
+        
+        self.plot_strain_field(component=0)
+        self.plot_strain_field(component=1)
+        
     
 #%%
 
@@ -620,12 +976,12 @@ domain = {
 }
     
 tractions = {
-    't1': { # Traction t1 (146,260 kPa) acts on the edge between nodes 2 and 3.
+    't1': { # Traction t1 (146,260) kPa acts on the edge between nodes 2 and 3.
         'traction'  :  np.array([146.0e3,260.0e3]), # Pa
         'nodes'     :   np.array([2,3])
         },
     
-    't2' : {  # Traction t2 (1900,0 kPa) acts on the edge between nodes 1 and 2.
+    't2' : {  # Traction t2 (1900,0) kPa acts on the edge between nodes 1 and 2.
         'traction'  :   np.array([1900.0e3,0.0]), #Pa
         'nodes'     :   np.array([1,2])
         }
@@ -634,5 +990,9 @@ tractions = {
 fe_solver = FiniteElement()
 
 fe_solver._set_system_params(domain, tractions, E, nu, thickness, 0.1)
+
+fe_solver.run_analysis(ref_max_volume=1e-4, tol_stress=0.01, max_iterations=20)
+
+fe_solver.plot_data()
 
 # %%

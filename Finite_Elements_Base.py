@@ -5,6 +5,7 @@ import meshpy.triangle as mp
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from scipy.spatial import cKDTree
 from numpy.polynomial.legendre import leggauss
 
 #%%
@@ -414,7 +415,6 @@ class Dunavant:
 
 #%%
 class FiniteElement:
-    
     def __init__(self):
         # Material properties
         self.Youngs_modulus = None
@@ -424,11 +424,11 @@ class FiniteElement:
         # System properties
         self.domain = None
         self.tractions = None
+        self.forces = None
 
         # Mesh properties        
         self.mesh = None
         self.nodes = None
-        self.num_nodes = None
         self.mesh_elements = None
         self.max_volume = None
         
@@ -441,13 +441,27 @@ class FiniteElement:
         self.Stress = None
         self.Strain = None
         
+        # Reference Solutions
+        self.ref_nodes = None
+        self.ref_mesh_elements = None
+        self.U_ref = None
+        self.Stress_ref = None
+        self.Strain_ref = None
+        
         # Refinement History
         self.num_element_history = []
         self.error_history = []
-
-        # Stress & Strain History
+        
         self.stress_error_history = []
         self.strain_error_history = []
+
+    @property
+    def num_nodes(self):
+        return self.nodes.shape[0]
+
+    @property
+    def num_elements(self):
+        return self.mesh_elements.shape[0]
     
     def _set_system_params(self, domain, tractions, E, nu, thickness, init_vol):
         self.domain = domain
@@ -458,21 +472,23 @@ class FiniteElement:
         self.max_volume = init_vol
         
     def _generate_mesh(self, max_volume=0.15):
-        vertices = self.domain.get('vertices').tolist()
-        segments = self.domain.get('edges').tolist()
+        vertices = self.domain.get('vertices')
+        segments = self.domain.get('edges')
+        if isinstance(vertices, np.ndarray):
+            vertices = vertices.tolist()
         
+        if isinstance(segments, np.ndarray):
+            segments = segments.tolist()
         mesh_info = mp.MeshInfo()
         mesh_info.set_points(vertices)
         mesh_info.set_facets(segments)
-        
         self.mesh = mp.build(mesh_info, max_volume=max_volume)
         self.nodes = np.array(self.mesh.points)
         self.mesh_elements = np.array(self.mesh.elements, dtype=int)
-        self.num_nodes = self.nodes.shape[0]
     
     def _shape_funcs(self, xi, eta):
-        N = np.array([1 - xi - eta, xi, eta])
-        dN = np.array([[-1, -1], [1, 0], [0, 1]])
+        N = np.array([xi, eta, 1 - xi - eta])
+        dN = np.array([[1, 0], [0, 1], [-1, -1]])
         return N, dN
     
     def _constitutive_matrix(self):
@@ -483,34 +499,70 @@ class FiniteElement:
             [nu, 1, 0],
             [0, 0, (1 - nu) / 2]
         ])
+        
+    def _element_stiffness(self, elem_idx):
+        
+        nodes_idx = self.mesh_elements[elem_idx]
+        
+        # Retrieve nodal coordinates
+        coords = self.nodes[nodes_idx, :]
+        x1, y1 = coords[0]
+        x2, y2 = coords[1]
+        x3, y3 = coords[2]
+        
+        # Compute element area
+        detJ = (x2 - x1)*(y3 - y1) - (x3 - x1)*(y2 - y1)
+        A_e = 0.5 * abs(detJ)
+        
+        # Compute B matrix coefficients
+        b1 = y2 - y3
+        b2 = y3 - y1
+        b3 = y1 - y2
+        
+        c1 = x3 - x2
+        c2 = x1 - x3
+        c3 = x2 - x1
+        
+        # Assemble B matrix
+        B = 1/ (2 * A_e)  * np.array([[b1,  0, b2,  0, b3,  0],
+                                      [ 0, c1,  0, c2,  0, c3],
+                                      [c1, b1, c2, b2, c3, b3]])
+        
+        D = self._constitutive_matrix()
+        t = self.plane_thickness
+        
+        # Compute element stiffness matrix
+        K_e = t * A_e * np.dot(B.T, np.dot(D, B))
+        
+        return K_e
     
-    def _apply_tractions(self):
-        for key, tr in self.tractions.items():
-            traction = tr['traction']
-            nodes_edge = tr['nodes']
-            n1, n2 = nodes_edge
-            p1 = self.nodes[n1]
-            p2 = self.nodes[n2]
-            L = np.linalg.norm(p2 - p1)
-            F_edge = (L / 2) * traction
-            self.F[2*n1:2*n1+2] += F_edge
-            self.F[2*n2:2*n2+2] += F_edge
-    
-    def _apply_boundary_conditions(self):
-        fixed_dofs = []
-        tol = 1e-6
-        for i, coord in enumerate(self.nodes):
-            if abs(coord[0]) < tol:
-                fixed_dofs.extend([2*i, 2*i+1])
-        for dof in fixed_dofs:
-            self.K[dof, :] = 0
-            self.K[:, dof] = 0
-            self.K[dof, dof] = 1
-            self.F[dof] = 0
-    
-    
-    
+    def _assemble_global_stiffness(self):
+        
+        # Initialise the global stiffness matrix.
+        n_nodes = self.num_nodes
+        K = np.zeros((2 * n_nodes, 2 * n_nodes))
+        
+        # Compute and assemble element stiffness matrices.
+        for elem_idx in range(self.num_elements):
+            
+            K_e = self._element_stiffness(elem_idx)
+            nodes_idx = self.mesh_elements[elem_idx]
+            
+            # For each node, the degrees of freedom are [2*i, 2*i+1]
+            dof_indices = []
+            for n in nodes_idx:
+                dof_indices.extend([2*n, 2*n+1])
+            
+            # Assemble the local stiffness matrix into the global stiffness matrix
+            for i in range(6):
+                for j in range(6):
+                    K[dof_indices[i], dof_indices[j]] += K_e[i, j]
+                    
+        self.K = K
 
+        
+    
+    
 #%%
 
 E = 4.4e7 # Pa
@@ -537,16 +589,20 @@ domain = {
 }
     
 tractions = {
-    't1': { # Traction t1 (146,260 kPa) acts on the edge between nodes 2 and 3.
+    't1': { # Traction t1 (146,260) kPa acts on the edge between nodes 2 and 3.
         'traction'  :  np.array([146.0e3,260.0e3]), # Pa
         'nodes'     :   np.array([2,3])
         },
     
-    't2' : {  # Traction t2 (1900,0 kPa) acts on the edge between nodes 1 and 2.
+    't2' : {  # Traction t2 (1900,0) kPa acts on the edge between nodes 1 and 2.
         'traction'  :   np.array([1900.0e3,0.0]), #Pa
         'nodes'     :   np.array([1,2])
         }
     }
+
+fe_solver = FiniteElement()
+
+fe_solver._set_system_params(domain, tractions, E, nu, thickness, 0.1)
 
 
 # %%
