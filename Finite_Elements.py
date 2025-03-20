@@ -926,7 +926,7 @@ class FiniteElement:
         
         triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], triangles=self.mesh_elements)
         plt.figure()
-        tpc = plt.tripcolor(triang, nodal_stress, edgecolors='k', shading='gouraud')
+        tpc = plt.tripcolor(triang, nodal_stress, edgecolors='k', shading='gouraud', cmap='viridis')
         plt.colorbar(tpc, label=f'Stress component (Pa)')
         plt.title(f'Stress Field in {dims[component]}-direction with Gouraud shading')
         plt.xlabel('x')
@@ -948,7 +948,7 @@ class FiniteElement:
         
         triang = tri.Triangulation(self.ref_nodes[:, 0], self.ref_nodes[:, 1], triangles=self.ref_mesh_elements)
         plt.figure()
-        tpc = plt.tripcolor(triang, nodal_stress, edgecolors='k', shading='gouraud')
+        tpc = plt.tripcolor(triang, nodal_stress, edgecolors='k', shading='gouraud', cmap='viridis')
         plt.colorbar(tpc, label=f'Stress component (Pa)')
         plt.title(f'Reference Stress Field in {dims[component]}-direction')
         plt.xlabel('x')
@@ -970,7 +970,7 @@ class FiniteElement:
         
         triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], triangles=self.mesh_elements)
         plt.figure()
-        tpc = plt.tripcolor(triang, nodal_strain, edgecolors='k', shading='gouraud')
+        tpc = plt.tripcolor(triang, nodal_strain, edgecolors='k', shading='gouraud', cmap='viridis')
         plt.colorbar(tpc, label='Strain component')
         plt.title(f'Strain Field in {dims[component]}-direction with Gouraud shading')
         plt.xlabel('x')
@@ -1002,7 +1002,7 @@ class FiniteElement:
         plt.legend()
         plt.show()
         
-    def plot_data(self):
+    def plot_data(self, scale=1.0):
         self.plot_mesh()
         
         self.plot_convergence()
@@ -1013,7 +1013,7 @@ class FiniteElement:
         self.plot_strain_field(component=0)
         self.plot_strain_field(component=1)
         
-        self.plot_nodal_displacement(scale=1.0)
+        self.plot_nodal_displacement(scale=scale)
         
 #%%
 
@@ -1054,7 +1054,7 @@ fe_solver = FiniteElement()
 
 fe_solver._set_system_params(domain, tractions, E, nu, thickness, 0.1)
 
-fe_solver.run_analysis(ref_max_volume=5e-5, tol_stress=0.01, max_iterations=20)
+fe_solver.run_analysis(ref_max_volume=1e-4, tol_stress=0.01, max_iterations=20)
 
 fe_solver.plot_data()
 
