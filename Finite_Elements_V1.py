@@ -1,4 +1,6 @@
 #%%
+# Key Libraries
+import logging
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
 import meshpy.triangle as mp
@@ -8,7 +10,23 @@ import scipy.sparse.linalg as spla
 from scipy.spatial import cKDTree
 from numpy.polynomial.legendre import leggauss
 
+# Set up logging
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
 #%%
+# Domain Class
+class Domain:
+    def __init__(self, vertices, edges):
+        """
+        vertices: NumPy array of shape (n, 2)
+        edges: NumPy array of shape (m, 2) with indices into vertices
+        """
+        self.vertices = vertices
+        self.edges = edges
+
+
+#%%
+# Dunavant Quadrature Class
 class Dunavant:
     
     """
@@ -414,6 +432,7 @@ class Dunavant:
         return xy, w
 
 #%%
+# Finite Element Class
 class FiniteElement:
     def __init__(self):
         # Material properties
@@ -435,6 +454,8 @@ class FiniteElement:
         # System Matrices
         self.K = None
         self.F = None
+        
+        
         self.U = None
         
         # Stress and Strain Fields
@@ -448,22 +469,20 @@ class FiniteElement:
         self.Stress_ref = None
         self.Strain_ref = None
         
-        # Refinement History
+        # Refinement History (mean relative error and element count)
         self.num_element_history = []
         self.error_history = []
         
-        self.stress_error_history = []
-        self.strain_error_history = []
-
     @property
     def num_nodes(self):
         return self.nodes.shape[0]
-
+    
     @property
     def num_elements(self):
         return self.mesh_elements.shape[0]
     
     def _set_system_params(self, domain, tractions, E, nu, thickness, init_vol):
+        
         self.domain = domain
         self.tractions = tractions
         self.Youngs_modulus = E
@@ -472,97 +491,530 @@ class FiniteElement:
         self.max_volume = init_vol
         
     def _generate_mesh(self, max_volume=0.15):
-        vertices = self.domain.get('vertices')
-        segments = self.domain.get('edges')
-        if isinstance(vertices, np.ndarray):
-            vertices = vertices.tolist()
         
-        if isinstance(segments, np.ndarray):
-            segments = segments.tolist()
+        vertices = self.domain.vertices
+        segments = self.domain.edges.tolist()
+        
         mesh_info = mp.MeshInfo()
-        mesh_info.set_points(vertices)
+        mesh_info.set_points(vertices.tolist())
         mesh_info.set_facets(segments)
+        
         self.mesh = mp.build(mesh_info, max_volume=max_volume)
         self.nodes = np.array(self.mesh.points)
         self.mesh_elements = np.array(self.mesh.elements, dtype=int)
     
     def _shape_funcs(self, xi, eta):
+        
         N = np.array([xi, eta, 1 - xi - eta])
         dN = np.array([[1, 0], [0, 1], [-1, -1]])
         return N, dN
     
     def _constitutive_matrix(self):
+        
         E = self.Youngs_modulus
         nu = self.Poisson_ratio
-        return E / (1 - nu**2) * np.array([
-            [1, nu, 0],
-            [nu, 1, 0],
-            [0, 0, (1 - nu) / 2]
-        ])
+        
+        return E / (1 - nu**2) * np.array([[1, nu, 0],[nu, 1, 0],[0, 0, (1 - nu)/2]])
         
     def _element_stiffness(self, elem_idx):
         
         nodes_idx = self.mesh_elements[elem_idx]
-        
-        # Retrieve nodal coordinates
         coords = self.nodes[nodes_idx, :]
         x1, y1 = coords[0]
         x2, y2 = coords[1]
         x3, y3 = coords[2]
         
-        # Compute element area
-        detJ = (x2 - x1)*(y3 - y1) - (x3 - x1)*(y2 - y1)
+        detJ = (x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)
         A_e = 0.5 * abs(detJ)
         
-        # Compute B matrix coefficients
-        b1 = y2 - y3
-        b2 = y3 - y1
-        b3 = y1 - y2
+        b1 = y2-y3; b2 = y3-y1; b3 = y1-y2
+        c1 = x3-x2; c2 = x1-x3; c3 = x2-x1
         
-        c1 = x3 - x2
-        c2 = x1 - x3
-        c3 = x2 - x1
-        
-        # Assemble B matrix
-        B = 1/ (2 * A_e)  * np.array([[b1,  0, b2,  0, b3,  0],
-                                      [ 0, c1,  0, c2,  0, c3],
-                                      [c1, b1, c2, b2, c3, b3]])
+        B = 1/(2*A_e) * np.array([[b1, 0, b2, 0, b3, 0],
+                                  [0, c1, 0, c2, 0, c3],
+                                  [c1, b1, c2, b2, c3, b3]])
         
         D = self._constitutive_matrix()
         t = self.plane_thickness
         
-        # Compute element stiffness matrix
         K_e = t * A_e * np.dot(B.T, np.dot(D, B))
-        
         return K_e
     
     def _assemble_global_stiffness(self):
-        
-        # Initialise the global stiffness matrix.
+        """
+        Assemble the global stiffness matrix in sparse COO format and convert to CSR.
+        This replaces the dense assembly to improve memory usage and speed for large systems.
+        """
         n_nodes = self.num_nodes
-        K = np.zeros((2 * n_nodes, 2 * n_nodes))
+        n_dof = 2 * n_nodes
         
-        # Compute and assemble element stiffness matrices.
+        # Each element with 3 nodes contributes a 6x6 block.
+        num_entries = self.num_elements * 36
+
+        # Preallocate arrays to hold row indices, column indices, and stiffness values.
+        rows = np.empty(num_entries, dtype=int)
+        cols = np.empty(num_entries, dtype=int)
+        data = np.empty(num_entries)
+
+        entry = 0
         for elem_idx in range(self.num_elements):
-            
             K_e = self._element_stiffness(elem_idx)
             nodes_idx = self.mesh_elements[elem_idx]
-            
-            # For each node, the degrees of freedom are [2*i, 2*i+1]
+            # Get DOF indices for the current element.
             dof_indices = []
             for n in nodes_idx:
-                dof_indices.extend([2*n, 2*n+1])
-            
-            # Assemble the local stiffness matrix into the global stiffness matrix
+                dof_indices.extend([2 * n, 2 * n + 1])
+            # Loop over the 6x6 element stiffness matrix and store indices and values.
             for i in range(6):
                 for j in range(6):
-                    K[dof_indices[i], dof_indices[j]] += K_e[i, j]
-                    
-        self.K = K
+                    rows[entry] = dof_indices[i]
+                    cols[entry] = dof_indices[j]
+                    data[entry] = K_e[i, j]
+                    entry += 1
 
+        # Create a COO-format sparse matrix and convert to CSR.
+        K_coo = sp.coo_matrix((data[:entry], (rows[:entry], cols[:entry])), shape=(n_dof, n_dof))
+        self.K = K_coo.tocsr()
         
+    def _get_nodes_on_edge(self, pt1, pt2, tol=1e-6):
+        """
+        Determine which nodes lie on the line segment between pt1 and pt2.
+        Uses projection parameter t (0<=t<=1) for robust detection.
+        Returns a sorted list of node indices.
+        """
+        vec = pt2 - pt1
+        norm_sq = np.dot(vec, vec)
+        nodes_on_edge = []
+        
+        for i, pt in enumerate(self.nodes):
+            t = np.dot(pt - pt1, vec) / norm_sq
+            
+            if 0 - tol <= t <= 1 + tol:
+                proj = pt1 + t * vec
+                
+                if np.linalg.norm(pt - proj) < tol:
+                    nodes_on_edge.append((i, t))
+                    
+        nodes_on_edge.sort(key=lambda x: x[1])
+        
+        return [idx for idx, t in nodes_on_edge]
     
+    def _set_boundary_conditions(self):
+        """
+        Applies Dirichlet BC (fixing nodes with x ≈ 0) and redistributes Neumann BC (traction)
+        along edges by distributing the load to all nodes on the edge.
+        """
+        # Dirichlet: fix nodes with x near 0.
+        fixed_nodes = [i for i, coord in enumerate(self.nodes) if abs(coord[0]) < 1e-8]
+        for node in fixed_nodes:
+            for dof in [2*node, 2*node+1]:
+                self.K[dof, :] = 0
+                self.K[:, dof] = 0
+                self.K[dof, dof] = 1
+                self.F[dof] = 0
+        
+        # Neumann: redistribute traction along edges.
+        if self.tractions is not None:
+            for key, bc in self.tractions.items():
+                if 'edge' in bc:
+                    edge_indices = bc['edge']
+                    pt1 = self.nodes[edge_indices[0]]
+                    pt2 = self.nodes[edge_indices[1]]
+                    sorted_nodes = self._get_nodes_on_edge(pt1, pt2)
+                    
+                    for j in range(len(sorted_nodes)-1):
+                        i1 = sorted_nodes[j]
+                        i2 = sorted_nodes[j+1]
+                        seg_length = np.linalg.norm(self.nodes[i2]-self.nodes[i1])
+                        force_segment = (seg_length * self.plane_thickness / 2) * np.array(bc['traction'])
+                        
+                        self.F[2*i1:2*i1+2] += force_segment
+                        self.F[2*i2:2*i2+2] += force_segment
+               
+                elif 'nodes' in bc:
+                    node_list = bc['nodes']
+                    if len(node_list) > 2:
+                        for j in range(len(node_list)-1):
+                            i1 = node_list[j]
+                            i2 = node_list[j+1]
+                            seg_length = np.linalg.norm(self.nodes[i2]-self.nodes[i1])
+                            force_segment = (seg_length * self.plane_thickness / 2) * np.array(bc['traction'])
+                            
+                            self.F[2*i1:2*i1+2] += force_segment
+                            self.F[2*i2:2*i2+2] += force_segment
+                    else:
+                        i1, i2 = node_list
+                        seg_length = np.linalg.norm(self.nodes[i2]-self.nodes[i1])
+                        force_segment = (seg_length * self.plane_thickness / 2) * np.array(bc['traction'])
+                        
+                        self.F[2*i1:2*i1+2] += force_segment
+                        self.F[2*i2:2*i2+2] += force_segment
+        
+        if self.forces is not None:
+            for force in self.forces:
+                node = force['node']
+                self.F[2*node:2*node+2] += np.array(force['force'])
+                
+    def solve_system(self):
+        try:
+            self.U = spla.spsolve(self.K, self.F)
+        
+        except np.linalg.LinAlgError as e:
+            logging.error("Error solving system: " + str(e))
+            raise e
+        
+    def compute_element_stress_strain(self, elem_idx):
+        
+        nodes_idx = self.mesh_elements[elem_idx]
+        coords = self.nodes[nodes_idx, :]
+        
+        dof_indices = []
+        for n in nodes_idx:
+            dof_indices.extend([2*n, 2*n+1])
+        U_e = self.U[dof_indices]
+       
+        x1, y1 = coords[0]
+        x2, y2 = coords[1]
+        x3, y3 = coords[2]
+        detJ = (x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)
+        A_e = 0.5 * abs(detJ)
+        
+        dN_dx = np.array([y2-y3, y3-y1, y1-y2])/(2*A_e)
+        dN_dy = np.array([x3-x2, x1-x3, x2-x1])/(2*A_e)
+        
+        B = np.zeros((3,6))
+        for i in range(3):
+            B[0,2*i] = dN_dx[i]
+            B[1,2*i+1] = dN_dy[i]
+            B[2,2*i] = dN_dy[i]
+            B[2,2*i+1] = dN_dx[i]
+            
+        strain = B.dot(U_e)
+        stress = self._constitutive_matrix().dot(strain)
+        
+        return strain, stress
     
+    def compute_reference_element_stress_strain(self, elem_idx):
+        
+        nodes_idx = self.ref_mesh_elements[elem_idx]
+        coords = self.ref_nodes[nodes_idx, :]
+        
+        dof_indices = []
+        
+        for n in nodes_idx:
+            dof_indices.extend([2*n, 2*n+1])
+        U_e = self.U_ref[dof_indices]
+        
+        x1, y1 = coords[0]
+        x2, y2 = coords[1]
+        x3, y3 = coords[2]
+        detJ = (x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)
+        A_e = 0.5 * abs(detJ)
+        
+        dN_dx = np.array([y2-y3, y3-y1, y1-y2])/(2*A_e)
+        dN_dy = np.array([x3-x2, x1-x3, x2-x1])/(2*A_e)
+        B = np.zeros((3,6))
+        
+        for i in range(3):
+            B[0,2*i] = dN_dx[i]
+            B[1,2*i+1] = dN_dy[i]
+            B[2,2*i] = dN_dy[i]
+            B[2,2*i+1] = dN_dx[i]
+            
+        strain = B.dot(U_e)
+        stress = self._constitutive_matrix().dot(strain)
+        
+        return strain, stress
+    
+    def _adaptive_refinement(self, tol=0.01, max_iter=10):
+        """
+        Adaptive refinement based on local L² stress error.
+        Flags elements with relative error > tol by inserting their centroids as new vertices.
+        Stops if the element count stagnates for 3 iterations.
+        The mean relative error is stored for convergence plotting.
+        """
+        if self.U_ref is None or self.ref_nodes is None or self.ref_mesh_elements is None:
+            logging.error("Reference solution not fully available.")
+            return
+
+        # Build KD-tree for reference mesh centroids.
+        ref_centroids = []
+        ref_stresses = []
+        
+        for i in range(len(self.ref_mesh_elements)):
+            coords = self.ref_nodes[self.ref_mesh_elements[i]]
+            centroid = np.mean(coords, axis=0)
+            ref_centroids.append(centroid)
+            
+            _, stress_ref = self.compute_reference_element_stress_strain(i)
+            ref_stresses.append(stress_ref)
+            
+        ref_centroids = np.array(ref_centroids)
+        ref_stresses = np.array(ref_stresses)
+        
+        self.ref_tree = cKDTree(ref_centroids)
+        self.ref_stresses = ref_stresses
+
+        quad = Dunavant(4)
+        stagnant_iterations = 0
+        prev_num_elements = self.num_elements
+
+        for iteration in range(max_iter):
+            refinement_points = []
+            element_errors = []
+            
+            for i in range(self.num_elements):
+                integrated_error, integrated_ref_stress, A_e = self._integrated_stress_error(i, quad)
+                rel_err = integrated_error / (integrated_ref_stress + 1e-8)
+                element_errors.append(rel_err)
+                
+                if rel_err > tol:
+                    centroid = np.mean(self.nodes[self.mesh_elements[i]], axis=0)
+                    refinement_points.append(centroid.tolist())
+            
+            mean_rel_error = np.mean(element_errors) if element_errors else 0
+            self.error_history.append(mean_rel_error)
+            self.num_element_history.append(self.num_elements)
+            logging.info(f"Iteration {iteration}: Mean relative stress error = {mean_rel_error:.3e}, Elements = {self.num_elements}")
+            
+            if self.num_elements == prev_num_elements:
+                stagnant_iterations += 1
+                
+            else:
+                stagnant_iterations = 0
+            prev_num_elements = self.num_elements
+            
+            if stagnant_iterations >= 3:
+                logging.info("Mesh refinement has stagnated. Halting further refinement.")
+                break
+            
+            if mean_rel_error < tol:
+                logging.info("Adaptive refinement converged.")
+                break
+            
+            current_vertices = self.domain.vertices
+            new_points = []
+            
+            for pt in refinement_points:
+                if not np.any(np.linalg.norm(current_vertices - np.array(pt), axis=1) < tol):
+                    new_points.append(pt)
+                    
+            if new_points:
+                new_points_arr = np.array(new_points)
+                current_vertices = np.vstack([current_vertices, new_points_arr])
+                self.domain.vertices = current_vertices
+            
+            self._generate_mesh(max_volume=self.max_volume)
+            self._assemble_global_stiffness()
+            self.F = np.zeros(2*self.num_nodes)
+            self._set_boundary_conditions()
+            self.solve_system()
+            
+    def _integrated_stress_error(self, elem_idx, quad_rule):
+        
+        nodes_idx = self.mesh_elements[elem_idx]
+        coords = self.nodes[nodes_idx, :]
+        
+        x1, y1 = coords[0]
+        x2, y2 = coords[1]
+        x3, y3 = coords[2]
+        detJ = (x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)
+        A_e = 0.5 * abs(detJ)
+        
+        _, stress_comp = self.compute_element_stress_strain(elem_idx)
+        
+        error_sq = 0.0
+        ref_stress_sq = 0.0
+        
+        for (xi, eta), w in zip(quad_rule.points, quad_rule.weights):
+            L1, L2 = xi, eta
+            L3 = 1 - xi - eta
+            
+            x = L1*x1 + L2*x2 + L3*x3
+            y = L1*y1 + L2*y2 + L3*y3
+            
+            dist, idx = self.ref_tree.query([x, y])
+            stress_ref = self.ref_stresses[idx]
+            
+            err = np.linalg.norm(stress_comp - stress_ref)
+            error_sq += w * err**2
+            ref_stress_sq += w * (np.linalg.norm(stress_ref))**2
+            
+        integrated_error = np.sqrt(error_sq) * (2*A_e)
+        integrated_ref_stress = np.sqrt(ref_stress_sq) * (2*A_e)
+        
+        return integrated_error, integrated_ref_stress, A_e
+            
+    def generate_reference_solution(self, ref_max_volume):
+        """
+        Generate a high-fidelity reference solution using a very fine mesh.
+        """
+        self._generate_mesh(max_volume=ref_max_volume)
+        self.plot_mesh()
+        
+        self._assemble_global_stiffness()
+        self.F = np.zeros(2*self.num_nodes)
+        self._set_boundary_conditions()
+        self.solve_system()
+        
+        self.ref_nodes = self.nodes.copy()
+        self.ref_mesh_elements = self.mesh_elements.copy()
+        self.U_ref = self.U.copy()
+        
+        stresses = []
+        for i in range(self.num_elements):
+            _, stress = self.compute_element_stress_strain(i)
+            stresses.append(stress)
+            
+        self.Stress_ref = np.array(stresses)
+        self.plot_stress_field_ref(component=0)
+        self.plot_stress_field_ref(component=1)
+        logging.info(f"Reference solution generated with {self.num_elements} elements.")
+        
+    def run_analysis(self, ref_max_volume=0.01, tol_stress=0.01, max_iterations=10):
+        """
+        Run the finite element analysis with adaptive refinement.
+        """
+        self.generate_reference_solution(ref_max_volume)
+        self._generate_mesh(max_volume=self.max_volume)
+        #self.plot_mesh()
+        
+        self._assemble_global_stiffness()
+        self.F = np.zeros(2*self.num_nodes)
+        self._set_boundary_conditions()
+        self.solve_system()
+        
+        initial_error = np.linalg.norm(self.F - self.K.dot(self.U))
+        self.error_history.append(initial_error)
+        self.num_element_history.append(self.num_elements)
+        logging.info(f"Initial global error = {initial_error:.3e}, number of elements = {self.num_elements}")
+        
+        self._adaptive_refinement(tol=tol_stress, max_iter=max_iterations)
+        
+        stresses = []
+        strains = []
+        for i in range(self.num_elements):
+            strain, stress = self.compute_element_stress_strain(i)
+            strains.append(strain)
+            stresses.append(stress)
+            
+        self.Strain = np.array(strains)
+        self.Stress = np.array(stresses)
+            
+    def plot_mesh(self):
+        
+        triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], triangles=self.mesh_elements)
+        plt.figure()
+        plt.triplot(triang, 'k-', lw=0.5)
+        plt.title('Finite Element Mesh')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+    
+    def plot_stress_field(self, component=0):
+        
+        dims = ['x', 'y']
+        num_nodes = self.nodes.shape[0]
+        stress_sum = np.zeros(num_nodes)
+        count = np.zeros(num_nodes)
+        
+        for i, elem in enumerate(self.mesh_elements):
+            for n in elem:
+                stress_sum[n] += self.Stress[i, component]
+                count[n] += 1
+        nodal_stress = stress_sum / np.maximum(count, 1)
+        
+        triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], triangles=self.mesh_elements)
+        plt.figure()
+        tpc = plt.tripcolor(triang, nodal_stress, edgecolors='k', shading='gouraud')
+        plt.colorbar(tpc, label=f'Stress component (Pa)')
+        plt.title(f'Stress Field in {dims[component]}-direction with Gouraud shading')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+        
+    def plot_stress_field_ref(self, component=0):
+        
+        dims = ['x', 'y']
+        num_nodes = self.ref_nodes.shape[0]
+        stress_sum = np.zeros(num_nodes)
+        count = np.zeros(num_nodes)
+        
+        for i, elem in enumerate(self.ref_mesh_elements):
+            for n in elem:
+                stress_sum[n] += self.Stress_ref[i, component]
+                count[n] += 1
+        nodal_stress = stress_sum / np.maximum(count, 1)
+        
+        triang = tri.Triangulation(self.ref_nodes[:, 0], self.ref_nodes[:, 1], triangles=self.ref_mesh_elements)
+        plt.figure()
+        tpc = plt.tripcolor(triang, nodal_stress, edgecolors='k', shading='gouraud')
+        plt.colorbar(tpc, label=f'Stress component (Pa)')
+        plt.title(f'Reference Stress Field in {dims[component]}-direction')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+        
+    def plot_strain_field(self, component=0):
+        
+        dims = ['x', 'y']
+        num_nodes = self.nodes.shape[0]
+        strain_sum = np.zeros(num_nodes)
+        count = np.zeros(num_nodes)
+        
+        for i, elem in enumerate(self.mesh_elements):
+            for n in elem:
+                strain_sum[n] += self.Strain[i, component]
+                count[n] += 1
+        nodal_strain = strain_sum / np.maximum(count, 1)
+        
+        triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], triangles=self.mesh_elements)
+        plt.figure()
+        tpc = plt.tripcolor(triang, nodal_strain, edgecolors='k', shading='gouraud')
+        plt.colorbar(tpc, label='Strain component')
+        plt.title(f'Strain Field in {dims[component]}-direction with Gouraud shading')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+        
+    def plot_convergence(self):
+        
+        plt.figure()
+        plt.plot(self.num_element_history[1:], self.error_history[1:], marker='o')
+        plt.xlabel("Number of Elements")
+        plt.ylabel("Mean Relative Stress Error")
+        plt.title("Error Convergence")
+        plt.show()
+        
+    def plot_nodal_displacement(self, scale=1.0):
+        """
+        Plot the deformed mesh based on nodal displacements.
+        """
+        deformed_nodes = self.nodes + scale * self.U.reshape(-1, 2)
+        triang_orig = tri.Triangulation(self.nodes[:,0], self.nodes[:,1], triangles=self.mesh_elements)
+        triang_def = tri.Triangulation(deformed_nodes[:,0], deformed_nodes[:,1], triangles=self.mesh_elements)
+        plt.figure()
+        plt.triplot(triang_orig, color='lightgray', linestyle='--', label='Original mesh')
+        plt.triplot(triang_def, color='blue', lw=1.5, label='Deformed mesh')
+        plt.title("Nodal Displacement (deformed mesh)")
+        plt.xlabel("x")
+        plt.ylabel("y")
+        plt.legend()
+        plt.show()
+        
+    def plot_data(self):
+        self.plot_mesh()
+        
+        self.plot_convergence()
+        
+        self.plot_stress_field(component=0)
+        self.plot_stress_field(component=1)
+        
+        self.plot_strain_field(component=0)
+        self.plot_strain_field(component=1)
+        
+        self.plot_nodal_displacement(scale=1.0)
+        
 #%%
 
 E = 4.4e7 # Pa
@@ -570,23 +1022,21 @@ nu = 0.37
 thickness = 0.08 # m
 alpha = 0.8 # m
 
-domain = {
-    'vertices': np.array(
-                [[0.0,0.0],
-                [2.0,0.5],
-                [2.0,1.0],
-                [alpha,1.0],
-                [0.0, 1.0]
-                ]),
-    
-    'edges':    np.array(
-                [[0,1],
-                [1,2],
-                [2,3],
-                [3,4],
-                [4,0]
-                ])
-}
+domain = Domain(
+        vertices=np.array([
+            [0.0, 0.0],
+            [2.0, 0.5],
+            [2.0, 1.0],
+            [alpha, 1.0],
+            [0.0, 1.0]]),
+        
+        edges=np.array([
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [3, 4],
+            [4, 0]])
+    )
     
 tractions = {
     't1': { # Traction t1 (146,260) kPa acts on the edge between nodes 2 and 3.
@@ -604,5 +1054,8 @@ fe_solver = FiniteElement()
 
 fe_solver._set_system_params(domain, tractions, E, nu, thickness, 0.1)
 
+fe_solver.run_analysis(ref_max_volume=5e-5, tol_stress=0.001, max_iterations=20)
+
+fe_solver.plot_data()
 
 # %%
