@@ -1,12 +1,14 @@
 #%% # Key Libraries
 import abc
 import logging
+
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
 import meshpy.triangle as mp
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+
 from scipy.spatial import cKDTree
 from numpy.polynomial.legendre import leggauss
 
@@ -629,9 +631,21 @@ class TriMesh(BaseMesh):
             [0,   0, (1 - nu)/2]
         ])
         
-        B, detJ = self.compute_B_matrix(elem_idx, xi=1/2, eta=1/2) # Evaluate at centroid since B is invariant of xi and eta
+        quad_rule = self.get_quadrature(order=4)  
         
-        K_e = plane_thickness * (B.T @ D @ B)
+        K_e = np.zeros((6, 6))
+        
+        
+        for i, (xi, eta) in enumerate(quad_rule.points):
+            
+            w = quad_rule.weights[i]
+            
+            B, detJ = self.compute_B_matrix(elem_idx, xi, eta)
+            
+            K_e += w * abs(detJ) * (B.T @ D @ B)
+
+        # Multiply by thickness
+        K_e *= plane_thickness
         
         return K_e
 
@@ -856,7 +870,7 @@ class QuadMesh(BaseMesh):
                 
                 B, detJ = self.compute_B_matrix(elem_idx, xi, eta)
                 
-                K_e += weights[i] * weights[j] * detJ * (B.T @ D @ B) * plane_thickness
+                K_e += weights[i] * weights[j] * abs(detJ) * (B.T @ D @ B) * plane_thickness
                 
         return K_e
     
@@ -1084,7 +1098,16 @@ class FiniteElement:
         B, detJ = self.ref_mesh_obj.compute_B_matrix(elem_idx, xi=0.5, eta=0.5)
     
         # Evaluate at centroid, same as main code
-        return self.plane_thickness * (B.T @ D @ B)
+        
+        if self.mesh_type == 'triangular':
+            return self.plane_thickness * (B.T @ D @ B) * 0.5 * abs(detJ)
+        
+        elif self.mesh_type == 'quadrilateral':
+            return self.plane_thickness * (B.T @ D @ B) * abs(detJ)
+        
+        else:
+            logging.error(f"Mesh type {self.mesh_type} not recognised.")
+            raise ValueError(f"Mesh type {self.mesh_type} not recognised.")
     
     def _assemble_global_stiffness(self):
         """
@@ -1253,7 +1276,6 @@ class FiniteElement:
                 self.F_ref[dof] = 0.0
                 
         # Neumann: redistribute traction along edges.
-        
         if self.tractions is not None:
             for key, bc in self.tractions.items():
                 if 'edge' in bc:
@@ -1313,7 +1335,7 @@ class FiniteElement:
         
     def compute_element_stress_strain(self, elem_idx):
         """
-        Compute strain and stress in a single element at convenient evaluation points.
+        Compute strain and stress in a single element at quadrature points.
         """
         
         nodes_idx = self.mesh_elements[elem_idx]
@@ -1325,14 +1347,13 @@ class FiniteElement:
             
         U_e = self.U[dof_indices]
         
-        quad_rule = self.mesh_obj.get_quadrature(order=3)
+        quad_rule = self.mesh_obj.get_quadrature(order=4)
         
         strain_sum = np.zeros(3)
         stress_sum = np.zeros(3)
         weight_sum = 0.0
         
         for (xi, eta), w in zip(quad_rule.points, quad_rule.weights):
-
             B, detJ = self.mesh_obj.compute_B_matrix(elem_idx, xi, eta)
 
             if abs(detJ) < 1e-14:
@@ -1373,7 +1394,7 @@ class FiniteElement:
             dof_indices.extend([2*n, 2*n+1])
         U_e = self.U_ref[dof_indices]
         
-        quad_rule = self.ref_mesh_obj.get_quadrature(order=3)
+        quad_rule = self.ref_mesh_obj.get_quadrature(order=5)
         
         strain_sum = np.zeros(3)
         stress_sum = np.zeros(3)
@@ -1762,7 +1783,7 @@ domain = Domain(
 tractions = {
     't1': { # Traction t1 (146,260) kPa acts on the edge between nodes 2 and 3.
         'traction'  :  np.array([146.0e3,260.0e3]), # Pa
-        'nodes'     :   np.array([2,3])
+        'nodes'     :   np.array([3,2])
         },
     
     't2' : {  # Traction t2 (1900,0) kPa acts on the edge between nodes 1 and 2.
@@ -1775,8 +1796,10 @@ fe_solver = FiniteElement(mesh_type="triangular")
 
 fe_solver._set_system_params(domain, E, nu, thickness, tractions=tractions, init_vol=0.1)
 
-fe_solver.run_analysis(ref_max_volume=1e-4, tol_stress=0.01, max_iterations=20)
+fe_solver.run_analysis(ref_max_volume=4e-5, tol_stress=0.01, max_iterations=20)
 
 fe_solver.plot_data()
+
+fe_solver.K.shape
 
 # %%
