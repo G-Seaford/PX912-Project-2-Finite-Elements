@@ -1,5 +1,5 @@
-#%%
-# Key Libraries
+#%% # Key Libraries
+import abc
 import logging
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
@@ -13,8 +13,7 @@ from numpy.polynomial.legendre import leggauss
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-#%%
-# Domain Class
+#%% # Domain Class
 class Domain:
     def __init__(self, vertices, edges):
         """
@@ -25,8 +24,7 @@ class Domain:
         self.edges = edges
 
 
-#%%
-# Dunavant Quadrature Class
+#%% # Dunavant Quadrature Class
 class Dunavant:
     
     """
@@ -431,10 +429,148 @@ class Dunavant:
                 raise ValueError(f"Illegal suborder value {suborder[s]} for rule {rule}.")
         return xy, w
 
-#%%
-# Finite Element Class for Triangular Domains
+#%% # Base Mesh Class
+
+class BaseMesh(abc.ABC):
+    """
+    Abstract base class for mesh objects.
+    """
+    
+    def __init__(self, domain):
+        self.domain = domain
+        self.mesh = None
+        self.nodes = None
+        self.mesh_elements = None
+        
+    @abc.abstractmethod
+    def generate_mesh(self):
+        """
+        Generate a mesh, storing self.nodes and self.mesh_elements.
+        """
+        pass
+
+    @abc.abstractmethod
+    def shape_funcs(self, xi, eta):
+        """
+        Return shape functions and local derivatives for a single element.
+        """
+        pass
+
+    @abc.abstractmethod
+    def element_stiffness(self, elem_idx, plane_thickness, E, nu, nodes, mesh_elements):
+        """
+        Compute the local stiffness matrix K_e for the element with index elem_idx.
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_nodes_on_edge(self, pt1, pt2, tol=1e-6):
+        """
+        Given two points in global coordinates, find which nodes lie on that line segment.
+        """
+        pass
+
+#%% # Triangular Mesh Class
+
+class TriMesh(BaseMesh):
+    """
+    Triangular mesh implementation using meshpy.triangle.
+    """
+    
+    def __init__(self, domain, max_volume):
+        self.domain = domain
+        self.mesh = None
+        self.nodes = None
+        self.mesh_elements = None
+        self.max_volume = max_volume
+    
+    def generate_mesh(self, max_volume):
+        """
+        Build a triangular mesh using meshpy.triangle.
+        """
+        vertices = self.domain.vertices
+        segments = self.domain.edges.tolist()
+        
+        mesh_info = mp.MeshInfo()
+        mesh_info.set_points(vertices.tolist())
+        mesh_info.set_facets(segments)
+        
+        self.mesh = mp.build(mesh_info, max_volume=max_volume)
+        self.nodes = np.array(self.mesh.points)
+        self.mesh_elements = np.array(self.mesh.elements, dtype=int)
+        
+    def shape_funcs(self, xi, eta):
+        """
+        Return shape functions (N) and their local derivatives (dN) for a linear triangular element.
+        """
+        N = np.array([xi, eta, 1 - xi - eta])
+        dN = np.array([[1,  0],
+                       [0,  1],
+                       [-1, -1]])
+        return N, dN
+
+    def element_stiffness(self, elem_idx, plane_thickness, E, nu, nodes, mesh_elements):
+        """
+        Compute the local stiffness matrix K_e for the triangular element with index elem_idx.
+        """
+        coords = nodes[mesh_elements[elem_idx], :]
+        x1, y1 = coords[0]
+        x2, y2 = coords[1]
+        x3, y3 = coords[2]
+        
+        detJ = (x2 - x1)*(y3 - y1) - (x3 - x1)*(y2 - y1)
+        A_e = 0.5 * abs(detJ)
+
+        # b_i and c_i terms
+        b1 = y2 - y3; b2 = y3 - y1; b3 = y1 - y2
+        c1 = x3 - x2; c2 = x1 - x3; c3 = x2 - x1
+        
+        # 2D plane stress constitutive matrix
+        D = E/(1 - nu**2) * np.array([
+            [1,   nu,      0],
+            [nu,  1,       0],
+            [0,   0, (1 - nu)/2]
+        ])
+        
+        B = (1/(2*A_e)) * np.array([
+            [b1,   0, b2,   0, b3,   0],
+            [0,   c1, 0,   c2, 0,   c3],
+            [c1,  b1, c2,  b2, c3,  b3]
+        ])
+        
+        K_e = plane_thickness * A_e * (B.T @ D @ B)
+        return K_e
+
+    def get_nodes_on_edge(self, pt1, pt2, tol=1e-6):
+        """
+        Find all nodes that lie on the line segment from pt1 to pt2 (in global coords).
+        Return sorted list of node indices.
+        """
+        vec = pt2 - pt1
+        norm_sq = np.dot(vec, vec)
+        nodes_on_edge = []
+        
+        for i, pt in enumerate(self.nodes):
+            t = np.dot(pt - pt1, vec) / norm_sq
+            if -tol <= t <= 1 + tol:
+                proj = pt1 + t * vec
+                if np.linalg.norm(pt - proj) < tol:
+                    dist_pt = np.linalg.norm(pt - pt1)
+                    nodes_on_edge.append((i, dist_pt))
+        
+        # Sort by distance from pt1
+        nodes_on_edge.sort(key=lambda x: x[1])
+        
+        return [idx for (idx, _) in nodes_on_edge]
+
+
+
+#%% # Finite Element Class
 class FiniteElement:
-    def __init__(self):
+    def __init__(self, mesh_type):
+        
+        self.mesh_type = mesh_type
+        
         # Material properties
         self.Youngs_modulus = None
         self.Poisson_ratio = None
@@ -445,7 +581,8 @@ class FiniteElement:
         self.tractions = None
         self.forces = None
 
-        # Mesh properties        
+        # Mesh properties      
+        self.mesh_obj = None  
         self.mesh = None
         self.nodes = None
         self.mesh_elements = None
@@ -479,33 +616,32 @@ class FiniteElement:
     def num_elements(self):
         return self.mesh_elements.shape[0]
     
-    def _set_system_params(self, domain, tractions, E, nu, thickness, init_vol):
+    def _set_system_params(self, domain, E, nu, thickness, tractions=None, init_vol=None):
         
         self.domain = domain
         self.tractions = tractions
         self.Youngs_modulus = E
         self.Poisson_ratio = nu
         self.plane_thickness = thickness
+        
         self.max_volume = init_vol
         
+        if self.mesh_type == 'triangular':
+            self.mesh_obj = TriMesh(self.domain, max_volume=self.max_volume)
+            
+        else: 
+            raise ValueError(f"Mesh type {self.mesh_type} not recognised.")
+        
     def _generate_mesh(self, max_volume=0.15):
+        """
+        Wrapper to call mesh generation method from the mesh object.
+        """
         
-        vertices = self.domain.vertices
-        segments = self.domain.edges.tolist()
+        self.mesh_obj.generate_mesh(max_volume)
         
-        mesh_info = mp.MeshInfo()
-        mesh_info.set_points(vertices.tolist())
-        mesh_info.set_facets(segments)
-        
-        self.mesh = mp.build(mesh_info, max_volume=max_volume)
-        self.nodes = np.array(self.mesh.points)
-        self.mesh_elements = np.array(self.mesh.elements, dtype=int)
-    
-    def _shape_funcs(self, xi, eta):
-        
-        N = np.array([xi, eta, 1 - xi - eta])
-        dN = np.array([[1, 0], [0, 1], [-1, -1]])
-        return N, dN
+        self.mesh = self.mesh_obj.mesh
+        self.nodes = self.mesh_obj.nodes
+        self.mesh_elements = self.mesh_obj.mesh_elements
     
     def _constitutive_matrix(self):
         
@@ -515,28 +651,11 @@ class FiniteElement:
         return E / (1 - nu**2) * np.array([[1, nu, 0],[nu, 1, 0],[0, 0, (1 - nu)/2]])
         
     def _element_stiffness(self, elem_idx):
+        """
+        Wrapper for computing element stiffness from the mesh object.
+        """
         
-        nodes_idx = self.mesh_elements[elem_idx]
-        coords = self.nodes[nodes_idx, :]
-        x1, y1 = coords[0]
-        x2, y2 = coords[1]
-        x3, y3 = coords[2]
-        
-        detJ = (x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)
-        A_e = 0.5 * abs(detJ)
-        
-        b1 = y2-y3; b2 = y3-y1; b3 = y1-y2
-        c1 = x3-x2; c2 = x1-x3; c3 = x2-x1
-        
-        B = 1/(2*A_e) * np.array([[b1, 0, b2, 0, b3, 0],
-                                  [0, c1, 0, c2, 0, c3],
-                                  [c1, b1, c2, b2, c3, b3]])
-        
-        D = self._constitutive_matrix()
-        t = self.plane_thickness
-        
-        K_e = t * A_e * np.dot(B.T, np.dot(D, B))
-        return K_e
+        return self.mesh_obj.element_stiffness(elem_idx, self.plane_thickness, self.Youngs_modulus, self.Poisson_ratio, self.nodes, self.mesh_elements)
     
     def _assemble_global_stiffness(self):
         """
@@ -544,10 +663,12 @@ class FiniteElement:
         This replaces the dense assembly to improve memory usage and speed for large systems.
         """
         n_nodes = self.num_nodes
-        n_dof = 2 * n_nodes
+        n_nodes_elem = self.mesh_elements.shape[1]
         
-        # Each element with 3 nodes contributes a 6x6 block.
-        num_entries = self.num_elements * 36
+        n_dof = 2 * n_nodes
+        n_dof_elem = 2 * n_nodes_elem
+        
+        num_entries = self.num_elements * (n_dof_elem * n_dof_elem)
 
         # Preallocate arrays to hold row indices, column indices, and stiffness values.
         rows = np.empty(num_entries, dtype=int)
@@ -558,13 +679,15 @@ class FiniteElement:
         for elem_idx in range(self.num_elements):
             K_e = self._element_stiffness(elem_idx)
             nodes_idx = self.mesh_elements[elem_idx]
+            
             # Get DOF indices for the current element.
             dof_indices = []
             for n in nodes_idx:
                 dof_indices.extend([2 * n, 2 * n + 1])
-            # Loop over the 6x6 element stiffness matrix and store indices and values.
-            for i in range(6):
-                for j in range(6):
+                
+            # Loop over the element stiffness matrix and store indices and values.
+            for i in range(n_dof_elem):
+                for j in range(n_dof_elem):
                     rows[entry] = dof_indices[i]
                     cols[entry] = dof_indices[j]
                     data[entry] = K_e[i, j]
@@ -576,26 +699,10 @@ class FiniteElement:
         
     def _get_nodes_on_edge(self, pt1, pt2, tol=1e-6):
         """
-        Determine which nodes lie on the line segment between pt1 and pt2.
-        Uses projection parameter t (0<=t<=1) for robust detection.
-        Returns a sorted list of node indices.
+        Wrapper to obtain sorted list of node indices on an edge from the mesh object.
         """
-        vec = pt2 - pt1
-        norm_sq = np.dot(vec, vec)
-        nodes_on_edge = []
         
-        for i, pt in enumerate(self.nodes):
-            t = np.dot(pt - pt1, vec) / norm_sq
-            
-            if 0 - tol <= t <= 1 + tol:
-                proj = pt1 + t * vec
-                
-                if np.linalg.norm(pt - proj) < tol:
-                    nodes_on_edge.append((i, t))
-                    
-        nodes_on_edge.sort(key=lambda x: x[1])
-        
-        return [idx for idx, t in nodes_on_edge]
+        return self.mesh_obj.get_nodes_on_edge(pt1, pt2, tol)
     
     def _set_boundary_conditions(self):
         """
@@ -753,7 +860,12 @@ class FiniteElement:
         self.ref_tree = cKDTree(ref_centroids)
         self.ref_stresses = ref_stresses
 
-        quad = Dunavant(4)
+        if self.mesh_type == "triangular":
+            quad = Dunavant(4)
+            
+        else:
+            raise ValueError(f"Unsupported mesh type: {self.mesh_type}")
+
         stagnant_iterations = 0
         prev_num_elements = self.num_elements
 
@@ -1013,7 +1125,7 @@ class FiniteElement:
         
         self.plot_nodal_displacement(scale=scale)
         
-#%%
+#%% # Example Usage
 
 E = 4.4e7 # Pa
 nu = 0.37
@@ -1048,9 +1160,9 @@ tractions = {
         }
     }
 
-fe_solver = FiniteElement()
+fe_solver = FiniteElement(mesh_type="triangular")
 
-fe_solver._set_system_params(domain, tractions, E, nu, thickness, 0.1)
+fe_solver._set_system_params(domain, E, nu, thickness, tractions=tractions, init_vol=0.1)
 
 fe_solver.run_analysis(ref_max_volume=1e-4, tol_stress=0.01, max_iterations=20)
 

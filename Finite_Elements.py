@@ -1,5 +1,5 @@
-#%%
-# Key Libraries
+#%% # Key Libraries
+import abc
 import logging
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
@@ -13,20 +13,37 @@ from numpy.polynomial.legendre import leggauss
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-#%%
-# Domain Class
+#%% # Domain Class
 class Domain:
     def __init__(self, vertices, edges):
         """
-        vertices: NumPy array of shape (n, 2)
-        edges: NumPy array of shape (m, 2) with indices into vertices
+        Simple container for a 2D domain data.
+        
+        Args:
+            vertices    : NumPy array of shape (n, 2)
+            edges       : NumPy array of shape (m, 2) with vertex indices
+        
         """
         self.vertices = vertices
         self.edges = edges
 
+#%% # Gauss-Legendre Class
 
-#%%
-# Dunavant Quadrature Class
+class GaussLegendreQuad:
+    """
+    Simple container for 2D Gauss-Legendre product quadrature data. 
+    """
+    
+    def __init__(self, points, weights):
+        """
+        Args:
+            points      : np.ndarray, quadrature points, shape (N, 2).
+            weights     : np.ndarray, quadrature weights, shape (N,).
+            
+        """
+        self.points = points
+        self.weights = weights
+#%% # Dunavant Quadrature Class
 class Dunavant:
     
     """
@@ -60,7 +77,7 @@ class Dunavant:
         degree    : polynomial degree of exactness (here taken equal to the rule number)
         order     : total number of quadrature points (computed from the suborder data)
         points    : NumPy array of shape (order, 2) with the quadrature points (in barycentric coordinates,
-                  where we interpret the first two coordinates as the x and y of the point)
+                    where we interpret the first two coordinates as the x and y of the point)
         weights   : NumPy array of length order containing the quadrature weights.
       
     """
@@ -364,6 +381,7 @@ class Dunavant:
         """
         if not (1 <= rule <= 20):
             raise ValueError(f"Rule must be between 1 and 20; got {rule}.")
+        
         self.rule = rule
         self.degree = self._compute_degree(rule)
         self.order = self._compute_order(rule)
@@ -375,8 +393,10 @@ class Dunavant:
     
     @classmethod
     def _compute_order(cls, rule):
+        
         if rule not in cls._suborder:
             raise ValueError(f"Suborder data for rule {rule} not available.")
+        
         return sum(cls._suborder[rule])
     
     @classmethod
@@ -389,12 +409,16 @@ class Dunavant:
         """
         if rule not in cls._suborder or rule not in cls._subrules:
             raise ValueError(f"Data for rule {rule} is not available.")
+        
         suborder = cls._suborder[rule]
         suborder_xyz, suborder_w = cls._subrules[rule]
+        
         suborder_num = len(suborder)
         total_order = sum(suborder)
+        
         xy = np.zeros((total_order, 2))
         w = np.zeros(total_order)
+        
         o = 0
         for s in range(suborder_num):
             if suborder[s] == 1:
@@ -402,6 +426,7 @@ class Dunavant:
                 xy[o, 1] = suborder_xyz[3*s + 1]
                 w[o] = suborder_w[s]
                 o += 1
+                
             elif suborder[s] == 3:
                 for k in range(3):
                     idx = 3 * s + (k % 3)
@@ -410,6 +435,7 @@ class Dunavant:
                     xy[o, 1] = suborder_xyz[idx_next]
                     w[o] = suborder_w[s]
                     o += 1
+                    
             elif suborder[s] == 6:
                 # First set of 3 points.
                 for k in range(3):
@@ -419,6 +445,7 @@ class Dunavant:
                     xy[o, 1] = suborder_xyz[idx_next]
                     w[o] = suborder_w[s]
                     o += 1
+                    
                 # Second set: reverse order.
                 for k in range(3):
                     idx = 3 * s + ((k + 1) % 3)
@@ -429,12 +456,499 @@ class Dunavant:
                     o += 1
             else:
                 raise ValueError(f"Illegal suborder value {suborder[s]} for rule {rule}.")
+            
         return xy, w
 
-#%%
-# Finite Element Class
+#%% # Base Mesh Class
+
+class BaseMesh(abc.ABC):
+    """
+    Abstract base class for mesh objects.
+    
+    Each mesh class should implement:
+      - generate_mesh()
+      - shape_funcs()
+      - element_stiffness()
+      - get_nodes_on_edge()
+      - get_default_quadrature()
+      - refine_mesh()
+    """
+    
+    def __init__(self, domain):
+        
+        self.domain = domain
+        self.mesh = None
+        self.nodes = None
+        self.mesh_elements = None
+
+    @abc.abstractmethod
+    def generate_mesh(self, max_vol):
+        """
+        Generate a mesh, storing self.nodes and self.mesh_elements.
+        """
+        pass
+
+    @abc.abstractmethod
+    def shape_funcs(self, xi, eta):
+        """
+        Return shape functions N and local derivatives dN for a single element 
+        in local coordinates (xi, eta).
+        """
+        pass
+    
+    @abc.abstractmethod
+    def compute_B_matrix(self, elem_idx, xi, eta):
+        """
+        Compute the B matrix for the element with index elem_idx.
+        """
+        pass
+
+    @abc.abstractmethod
+    def element_stiffness(self, elem_idx, plane_thickness, E, nu, nodes, mesh_elements):
+        """
+        Compute the local stiffness matrix for the element with index elem_idx.
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_nodes_on_edge(self, pt1, pt2, tol=1e-6):
+        """
+        Given two points in global coords, find which nodes lie on that line segment.
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_quadrature(self, order):
+        """
+        Return a relevant quadrature rule of given order.
+        """
+        pass
+
+    @abc.abstractmethod
+    def refine_mesh(self, refinement_points):
+        """
+        Refine the mesh by adding new points or adjusting the mesh structure.
+        """
+        pass
+
+#%% # Triangular Mesh Class
+
+class TriMesh(BaseMesh):
+    """
+    Triangular mesh implementation using meshpy.triangle.
+    """
+    
+    def __init__(self, domain, max_volume):
+        
+        super().__init__(domain)
+        self.max_volume = max_volume
+
+    
+    def generate_mesh(self, max_vol):
+        """
+        Build a triangular mesh using meshpy.triangle.
+        """
+        
+        if max_vol is None:
+            max_vol = self.max_volume
+
+        vertices = self.domain.vertices
+        segments = self.domain.edges.tolist()
+        
+        mesh_info = mp.MeshInfo()
+        mesh_info.set_points(vertices.tolist())
+        mesh_info.set_facets(segments)
+        
+        # Try to construct mesh using meshpy
+        try:
+            self.mesh = mp.build(mesh_info, max_volume=max_vol)
+            
+        except Exception as e:
+            logging.error(f"Mesh generation failed for TriMesh: {e}")
+            raise
+
+        self.nodes = np.array(self.mesh.points)
+        self.mesh_elements = np.array(self.mesh.elements, dtype=int)
+        
+    def shape_funcs(self, xi, eta):
+        """
+        Return shape functions (N) and their local derivatives (dN) for a linear triangular element.
+        """
+        N = np.array([xi, eta, 1 - xi - eta])
+        
+        dN = np.array([[1,  0],
+                       [0,  1],
+                       [-1, -1]])
+        return N, dN
+    
+    def compute_B_matrix(self, elem_idx, xi, eta):
+        """
+        Build and return the strain-displacement (B) matrix at local coordinates (xi, eta).
+        """
+        nodes_idx = self.mesh_elements[elem_idx]
+        coords = self.nodes[nodes_idx, :]
+        
+        N, dN = self.shape_funcs(xi, eta)
+                
+        # Jacobian matrix
+        J = dN.T @ coords
+                
+        detJ = np.linalg.det(J)
+        if abs(detJ) < 1e-14:
+            logging.warning(f"Near-singular Jacobian in element {elem_idx} at xi={xi}, eta={eta}.")
+                
+        try:
+            invJ = np.linalg.inv(J)
+                    
+        except np.linalg.LinAlgError as e:
+            logging.error(f"Singular Jacobian in QuadMesh element {elem_idx}: {e}")
+            raise ValueError(f"Singular Jacobian in element {elem_idx}.")
+                
+        dN_global = dN @ invJ
+                
+        # B matrix
+        B = np.zeros((3, 6))
+                
+        B[0, 0::2] = dN_global[:, 0]
+        B[1, 1::2] = dN_global[:, 1]
+        B[2, 0::2] = dN_global[:, 1]
+        B[2, 1::2] = dN_global[:, 0]
+        
+        return B, detJ
+        
+
+    def element_stiffness(self, elem_idx, plane_thickness, E, nu, nodes, mesh_elements):
+        """
+        Compute the local stiffness matrix K_e for the triangular element with index elem_idx.
+        """
+        
+        # 2D plane stress constitutive matrix
+        D = E/(1 - nu**2) * np.array([
+            [1,   nu,      0],
+            [nu,  1,       0],
+            [0,   0, (1 - nu)/2]
+        ])
+        
+        B, detJ = self.compute_B_matrix(elem_idx, xi=1/2, eta=1/2) # Evaluate at centroid since B is invariant of xi and eta
+        
+        K_e = plane_thickness * (B.T @ D @ B)
+        
+        return K_e
+
+    def get_nodes_on_edge(self, pt1, pt2, tol=1e-6):
+        """
+        Find all nodes that lie on the line segment from pt1 to pt2 (in global coords).
+        Return sorted list of node indices.
+        """
+        vec = pt2 - pt1
+        norm_sq = np.dot(vec, vec)
+        nodes_on_edge = []
+        
+        for i, pt in enumerate(self.nodes):
+            t = np.dot(pt - pt1, vec) / norm_sq
+            
+            if -tol <= t <= 1 + tol:
+                proj = pt1 + t * vec
+                
+                if np.linalg.norm(pt - proj) < tol:
+                    dist_pt = np.linalg.norm(pt - pt1)
+                    nodes_on_edge.append((i, dist_pt))
+        
+        # Sort by distance from pt1
+        nodes_on_edge.sort(key=lambda x: x[1])
+        
+        return [idx for (idx, _) in nodes_on_edge]
+    
+    def get_quadrature(self, order):
+        """
+        Return  Dunavant quadrature data for rule 'order'. 
+        """
+        
+        if order < 1 or order > 20:
+            logging.error(f"Invalid Dunavant quadrature rule passed to get_quadrature : {rule}. Rule must be between 1 and 20.")
+            raise ValueError(f"Dunavant rule must be between 1 and 20, got {rule}.")
+            
+        return Dunavant(rule=order)
+    
+    def refine_mesh(self, refinement_points = None, tol=1e-6):
+        """
+        Refine the triangular mesh by inserting the given points into the domain vertices.
+        
+        Args:
+            refinement_points : list of 2D coordinates
+            tol               : float, tolerance for checking existing proximity
+        """
+        if refinement_points is None:
+            logging.info("No refinement points provided, skipping refine_mesh.")
+            return
+        
+        old_vertices = self.domain.vertices
+        new_pts = []
+        
+        for pt in refinement_points:
+            pt_arr = np.array(pt)
+            
+            # Check if this point is already in the domain within 'tol'
+            dist = np.linalg.norm(old_vertices - pt_arr, axis=1)
+            if np.all(dist > tol):
+                new_pts.append(pt_arr)
+        
+        if new_pts:
+            new_pts_arr = np.array(new_pts)
+            self.domain.vertices = np.vstack([old_vertices, new_pts_arr])
+            
+        else:
+            logging.info("No new points passed the tolerance check; skipping refinement.")
+
+
+#%% # Quadrilateral Mesh Class
+
+class QuadMesh(BaseMesh):
+    """
+    Quadrilateral mesh implementation for a convex quadrilateral domain.
+    Each element is a 4-node bilinear quad, subdividing the domain Nx by Ny.
+    """
+    
+    def __init__(self, domain, Nx, Ny):
+        
+        super().__init__(domain)
+        self.Nx = Nx
+        self.Ny = Ny
+        
+    def generate_mesh(self, max_vol=None):
+        """
+        Build a structured quadrilateral mesh by bilinear interpolation 
+        from domain corners.
+        
+        Args:
+            max_volume : float, optional, Currently unused, but kept for consistency with other mesh classes.
+        """
+        
+        if len(self.domain.vertices) != 4:
+            
+            logging.error("QuadMesh requires exactly 4 domain vertices in CCW order.")
+            raise ValueError("Domain must have exactly 4 vertices for QuadMesh.")
+        
+        # Extract domain corners in CCW order
+        A = self.domain.vertices[0]
+        B = self.domain.vertices[1]
+        C = self.domain.vertices[2]
+        D = self.domain.vertices[3]
+
+        node_coords = []
+        
+        for j in range(self.Ny+1):
+            v = j / self.Ny
+            for i in range(self.Nx+1):
+                u = i / self.Nx
+                
+                # Bilinear interpolation
+                X = (1 - u)*(1 - v)*A \
+                    + u*(1 - v)*B \
+                    + u*v*C \
+                    + (1 - u)*v*D
+                node_coords.append(X)
+
+        node_coords = np.array(node_coords)
+        self.nodes = node_coords
+
+        # Build element connectivity
+        elements = []
+        for j in range(self.Ny):
+            for i in range(self.Nx):
+                n0 = j*(self.Nx+1) + i
+                n1 = j*(self.Nx+1) + (i+1)
+                n2 = (j+1)*(self.Nx+1) + (i+1)
+                n3 = (j+1)*(self.Nx+1) + i
+                elements.append([n0, n1, n2, n3])
+
+        self.mesh_elements = np.array(elements, dtype=int)
+        
+        logging.info(f"QuadMesh generated with {self.Nx} x {self.Ny} elements. "
+                     f"Total nodes: {self.nodes.shape[0]}. "
+                     f"Total elements: {self.mesh_elements.shape[0]}.")
+        
+    def shape_funcs(self, xi, eta):
+        """
+        Bilinear shape functions for a 4-node quad in local coords (xi, eta),
+        each in [-1, +1].
+        
+        Returns:
+            N : np.ndarray, shape (4,)
+                The shape functions at (xi, eta).
+            dN : np.ndarray, shape (4, 2)
+                The derivatives of shape functions wrt (xi, eta).
+        """
+        N = np.array([0.25*(1 - xi)*(1 - eta), 
+                      0.25*(1 + xi)*(1 - eta),
+                      0.25*(1 + xi)*(1 + eta), 
+                      0.25*(1 - xi)*(1 + eta)])
+
+        dN = np.array([
+            [-0.25*(1 - eta), -0.25*(1 - xi)],
+            [ 0.25*(1 - eta), -0.25*(1 + xi)],
+            [ 0.25*(1 + eta),  0.25*(1 + xi)],
+            [-0.25*(1 + eta),  0.25*(1 - xi)],
+        ])
+
+        return N, dN
+    
+    def compute_B_matrix(self, elem_idx, xi, eta):
+        """
+        Build and return the strain-displacement (B) matrix for the quadrilateral element.
+        """
+        nodes_idx = self.mesh_elements[elem_idx]
+        coords = self.nodes[nodes_idx, :]
+        
+        N, dN = self.shape_funcs(xi, eta)
+                
+        # Jacobian matrix
+        J = dN.T @ coords
+                
+        detJ = np.linalg.det(J)
+        if abs(detJ) < 1e-14:
+            logging.warning(f"Near-singular Jacobian in element {elem_idx} at xi={xi}, eta={eta}.")
+                
+        try:
+            invJ = np.linalg.inv(J)
+                    
+        except np.linalg.LinAlgError as e:
+            logging.error(f"Singular Jacobian in QuadMesh element {elem_idx}: {e}")
+            raise ValueError(f"Singular Jacobian in element {elem_idx}.")
+                
+        dN_global = dN @ invJ
+                
+        # B matrix
+        B = np.zeros((3, 8))
+                
+        B[0, 0::2] = dN_global[:, 0]
+        B[1, 1::2] = dN_global[:, 1]
+        B[2, 0::2] = dN_global[:, 1]
+        B[2, 1::2] = dN_global[:, 0]
+        
+        return B, detJ
+        
+    
+    def element_stiffness(self, elem_idx, plane_thickness, E, nu, nodes, mesh_elements):
+        """
+        Compute the local stiffness matrix K_e for the bilinear quad #elem_idx,
+        using 2×2 Gauss–Legendre integration over xi,eta in [-1,+1].
+
+        Returns:
+            K_e : np.ndarray, Local stiffness matrix.
+        """
+        
+        elem_nodes = mesh_elements[elem_idx]
+        coords = nodes[elem_nodes]
+        
+        D = E / (1 - nu**2) * np.array([
+                                        [1,   nu,          0],
+                                        [nu,  1,           0],
+                                        [0,   0,  (1 - nu)/2]
+                                        ])
+        
+        K_e = np.zeros((8, 8))
+        
+        points, weights = leggauss(3)
+        
+        for i, xi in enumerate(points):
+            for j, eta in enumerate(points):
+                
+                B, detJ = self.compute_B_matrix(elem_idx, xi, eta)
+                
+                K_e += weights[i] * weights[j] * detJ * (B.T @ D @ B) * plane_thickness
+                
+        return K_e
+    
+    def get_nodes_on_edge(self, pt1, pt2, tol=1e-6):
+        """
+        Find all nodes that lie on the line segment from pt1 to pt2 (in global coords).
+        
+        Returns:
+            A sorted list of node indices (sorted by distance from pt1).
+        """
+        
+        vec = pt2 - pt1
+        norm_sq = np.dot(vec, vec)
+        nodes_on_edge = []
+        
+        for i, pt in enumerate(self.nodes):
+            t = np.dot(pt - pt1, vec) / norm_sq
+            if 0 - tol <= t <= 1 + tol:
+                proj = pt1 + t*vec
+                
+                if np.linalg.norm(pt - proj) < tol:
+                    dist_pt = np.linalg.norm(pt - pt1)
+                    nodes_on_edge.append((i, dist_pt))
+                    
+        nodes_on_edge.sort(key=lambda x: x[1])
+        
+        return [idx for (idx, _) in nodes_on_edge]
+    
+    def get_quadrature(self, order):
+        """
+        Return a product Gauss–Legendre quadrature of given order for quadrilaterals.
+        """
+        
+        points_1D, weights_1D = leggauss(order)
+        
+        quad_points = []
+        quad_weights = []
+        
+        for i, xi in enumerate(points_1D):
+            for j, eta in enumerate(points_1D):
+                quad_points.append([xi, eta])
+                quad_weights.append(weights_1D[i] * weights_1D[j])
+                
+        return GaussLegendreQuad(np.array(quad_points), np.array(quad_weights))
+
+    def refine_mesh(self, refinement_points=None, tol=1e-6):
+        """
+        Refine the quadrilateral mesh by inserting the given points into the domain vertices.
+        Currently a W.I.P.
+
+        Args:
+            refinement_points : list of 2D coordinates
+            tol              : float, tolerance for checking existing proximity
+        """
+        
+        if refinement_points is None:
+            logging.info("No refinement points provided, skipping refine_mesh for QuadMesh.")
+            return
+        
+        old_vertices = self.domain.vertices
+        new_pts = []
+        
+        for pt in refinement_points:
+            pt_arr = np.array(pt)
+            dist = np.linalg.norm(old_vertices - pt_arr, axis=1)
+            
+            if np.all(dist > tol):
+                new_pts.append(pt_arr)
+        
+        if new_pts:
+            new_pts_arr = np.array(new_pts)
+            self.domain.vertices = np.vstack([old_vertices, new_pts_arr])
+            
+            logging.info(f"Added {len(new_pts_arr)} new points to domain vertices for QuadMesh refinement.")
+        else:
+            logging.info("No new points passed the tolerance check; skipping refinement.")
+            
+        
+#%% # Finite Element Class
 class FiniteElement:
-    def __init__(self):
+    """
+    Main Finite Element solver class that uses either TriMesh or QuadMesh, but can be extended to additional configs.
+    Handles system assembly, boundary conditions, solution, and adaptive refinement.
+    """
+    def __init__(self, mesh_type):
+        """
+        Args:
+            mesh_type : str, either 'triangular' or 'quadrilateral'
+        """
+        
+        self.mesh_type = mesh_type
+        
         # Material properties
         self.Youngs_modulus = None
         self.Poisson_ratio = None
@@ -445,7 +959,8 @@ class FiniteElement:
         self.tractions = None
         self.forces = None
 
-        # Mesh properties        
+        # Mesh properties      
+        self.mesh_obj = None  
         self.mesh = None
         self.nodes = None
         self.mesh_elements = None
@@ -454,8 +969,6 @@ class FiniteElement:
         # System Matrices
         self.K = None
         self.F = None
-        
-        
         self.U = None
         
         # Stress and Strain Fields
@@ -463,8 +976,11 @@ class FiniteElement:
         self.Strain = None
         
         # Reference Solutions
+        self.ref_mesh_obj = None 
         self.ref_nodes = None
         self.ref_mesh_elements = None
+        self.K_ref = None
+        self.F_ref = None
         self.U_ref = None
         self.Stress_ref = None
         self.Strain_ref = None
@@ -478,78 +994,108 @@ class FiniteElement:
         return self.nodes.shape[0]
     
     @property
+    def ref_num_nodes(self):
+        return self.ref_nodes.shape[0]
+    
+    @property
     def num_elements(self):
         return self.mesh_elements.shape[0]
     
-    def _set_system_params(self, domain, tractions, E, nu, thickness, init_vol):
+    @property
+    def ref_num_elements(self):
+        return self.ref_mesh_elements.shape[0]
+    
+    def _set_system_params(self, domain, E, nu, thickness, tractions=None, forces=None, init_vol=None, Nx=None, Ny=None):
+        """
+        Set up the domain, mesh parameters, and material properties.
+        """
         
         self.domain = domain
         self.tractions = tractions
+        self.forces = forces
         self.Youngs_modulus = E
         self.Poisson_ratio = nu
         self.plane_thickness = thickness
+        
         self.max_volume = init_vol
+        self.Nx = Nx
+        self.Ny = Ny
+        
+        if self.mesh_type == 'triangular':
+            if self.max_volume is None:
+                logging.error("Max volume must be specified for triangular mesh.")
+                raise ValueError("Max volume must be specified for triangular mesh.")
+            
+            self.mesh_obj = TriMesh(self.domain, max_volume=self.max_volume)
+        
+        elif self.mesh_type == 'quadrilateral':
+            if Nx is None or Ny is None:
+                logging.error("Nx, Ny must be specified for quadrilateral mesh.")
+                raise ValueError("Nx, Ny must be specified for quadrilateral mesh.")
+            
+            self.mesh_obj = QuadMesh(self.domain, Nx=self.Nx, Ny=self.Ny)
+            
+        else: 
+            logging.error(f"Mesh type {self.mesh_type} not recognised.")
+            raise ValueError(f"Mesh type {self.mesh_type} not recognised.")
+        
         
     def _generate_mesh(self, max_volume=0.15):
+        """
+        Wrapper to call mesh generation method from the mesh object.
+        """
         
-        vertices = self.domain.vertices
-        segments = self.domain.edges.tolist()
+        self.mesh_obj.generate_mesh(max_volume)
         
-        mesh_info = mp.MeshInfo()
-        mesh_info.set_points(vertices.tolist())
-        mesh_info.set_facets(segments)
-        
-        self.mesh = mp.build(mesh_info, max_volume=max_volume)
-        self.nodes = np.array(self.mesh.points)
-        self.mesh_elements = np.array(self.mesh.elements, dtype=int)
-    
-    def _shape_funcs(self, xi, eta):
-        
-        N = np.array([xi, eta, 1 - xi - eta])
-        dN = np.array([[1, 0], [0, 1], [-1, -1]])
-        return N, dN
+        self.mesh = self.mesh_obj.mesh
+        self.nodes = self.mesh_obj.nodes
+        self.mesh_elements = self.mesh_obj.mesh_elements
     
     def _constitutive_matrix(self):
         
         E = self.Youngs_modulus
         nu = self.Poisson_ratio
         
-        return E / (1 - nu**2) * np.array([[1, nu, 0],[nu, 1, 0],[0, 0, (1 - nu)/2]])
+        return E / (1 - nu**2) * np.array([[  1, nu,          0],
+                                           [ nu,  1,          0],
+                                           [  0,  0, (1 - nu)/2]])
         
     def _element_stiffness(self, elem_idx):
+        """
+        Wrapper for computing element stiffness from the mesh object.
+        """
         
-        nodes_idx = self.mesh_elements[elem_idx]
-        coords = self.nodes[nodes_idx, :]
-        x1, y1 = coords[0]
-        x2, y2 = coords[1]
-        x3, y3 = coords[2]
+        return self.mesh_obj.element_stiffness(elem_idx, self.plane_thickness, self.Youngs_modulus, 
+                                               self.Poisson_ratio, self.nodes, self.mesh_elements)
         
-        detJ = (x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)
-        A_e = 0.5 * abs(detJ)
+    def _element_stiffness_ref(self, elem_idx):
+        """
+        Exactly like _element_stiffness, but uses the reference mesh object 
+        and reference arrays.
+        """
+        # 2D plane stress
+        E = self.Youngs_modulus
+        nu = self.Poisson_ratio
+        D = E / (1 - nu**2) * np.array([[  1, nu,          0],
+                                        [ nu,  1,          0],
+                                        [  0,  0, (1 - nu)/2]])
         
-        b1 = y2-y3; b2 = y3-y1; b3 = y1-y2
-        c1 = x3-x2; c2 = x1-x3; c3 = x2-x1
-        
-        B = 1/(2*A_e) * np.array([[b1, 0, b2, 0, b3, 0],
-                                  [0, c1, 0, c2, 0, c3],
-                                  [c1, b1, c2, b2, c3, b3]])
-        
-        D = self._constitutive_matrix()
-        t = self.plane_thickness
-        
-        K_e = t * A_e * np.dot(B.T, np.dot(D, B))
-        return K_e
+        # Use reference mesh object
+        B, detJ = self.ref_mesh_obj.compute_B_matrix(elem_idx, xi=0.5, eta=0.5)
+    
+        # Evaluate at centroid, same as main code
+        return self.plane_thickness * (B.T @ D @ B)
     
     def _assemble_global_stiffness(self):
         """
         Assemble the global stiffness matrix in sparse COO format and convert to CSR.
-        This replaces the dense assembly to improve memory usage and speed for large systems.
         """
-        n_nodes = self.num_nodes
-        n_dof = 2 * n_nodes
         
-        # Each element with 3 nodes contributes a 6x6 block.
-        num_entries = self.num_elements * 36
+        n_nodes_elem = self.mesh_elements.shape[1]
+        n_dof = 2 * self.num_nodes
+        n_dof_elem = 2 * n_nodes_elem
+        
+        num_entries = self.num_elements * (n_dof_elem * n_dof_elem)
 
         # Preallocate arrays to hold row indices, column indices, and stiffness values.
         rows = np.empty(num_entries, dtype=int)
@@ -560,13 +1106,15 @@ class FiniteElement:
         for elem_idx in range(self.num_elements):
             K_e = self._element_stiffness(elem_idx)
             nodes_idx = self.mesh_elements[elem_idx]
+            
             # Get DOF indices for the current element.
             dof_indices = []
             for n in nodes_idx:
                 dof_indices.extend([2 * n, 2 * n + 1])
-            # Loop over the 6x6 element stiffness matrix and store indices and values.
-            for i in range(6):
-                for j in range(6):
+                
+            # Loop over the element stiffness matrix and store indices and values.
+            for i in range(n_dof_elem):
+                for j in range(n_dof_elem):
                     rows[entry] = dof_indices[i]
                     cols[entry] = dof_indices[j]
                     data[entry] = K_e[i, j]
@@ -576,34 +1124,61 @@ class FiniteElement:
         K_coo = sp.coo_matrix((data[:entry], (rows[:entry], cols[:entry])), shape=(n_dof, n_dof))
         self.K = K_coo.tocsr()
         
+    def _assemble_reference_stiffness(self):
+        """
+        Assemble the reference stiffness matrix K_ref in sparse format
+        using self.ref_mesh_obj, self.ref_nodes, self.ref_mesh_elements, etc.
+        """
+        
+        n_nodes_elem = self.ref_mesh_elements.shape[1]
+        n_dof_ref = 2 * self.ref_nodes.shape[0]
+        n_dof_elem = 2 * n_nodes_elem
+    
+        num_entries = self.ref_mesh_elements.shape[0]* (n_dof_elem * n_dof_elem)
+        
+        # Preallocate arrays to hold row indices, column indices, and stiffness values.
+        rows = np.empty(num_entries, dtype=int)
+        cols = np.empty(num_entries, dtype=int)
+        data = np.empty(num_entries)
+    
+        entry = 0
+        for elem_idx in range(self.ref_mesh_elements.shape[0]):
+            K_e = self._element_stiffness_ref(elem_idx)  # see below
+            nodes_idx = self.ref_mesh_elements[elem_idx]
+        
+            # Get DOF indices for the current element.
+            dof_indices = []
+            for n in nodes_idx:
+                dof_indices.extend([2*n, 2*n+1])
+        
+            # Loop over the element stiffness matrix and store indices and values.
+            for i in range(n_dof_elem):
+                for j in range(n_dof_elem):
+                    rows[entry] = dof_indices[i]
+                    cols[entry] = dof_indices[j]
+                    data[entry] = K_e[i,j]
+                    entry += 1
+    
+        K_coo = sp.coo_matrix((data[:entry], (rows[:entry], cols[:entry])), shape=(n_dof_ref, n_dof_ref))
+        
+        self.K_ref = K_coo.tocsr()
+        
+        
     def _get_nodes_on_edge(self, pt1, pt2, tol=1e-6):
         """
-        Determine which nodes lie on the line segment between pt1 and pt2.
-        Uses projection parameter t (0<=t<=1) for robust detection.
-        Returns a sorted list of node indices.
+        Wrapper to obtain sorted list of node indices on an edge from the mesh object.
         """
-        vec = pt2 - pt1
-        norm_sq = np.dot(vec, vec)
-        nodes_on_edge = []
         
-        for i, pt in enumerate(self.nodes):
-            t = np.dot(pt - pt1, vec) / norm_sq
-            
-            if 0 - tol <= t <= 1 + tol:
-                proj = pt1 + t * vec
-                
-                if np.linalg.norm(pt - proj) < tol:
-                    nodes_on_edge.append((i, t))
-                    
-        nodes_on_edge.sort(key=lambda x: x[1])
-        
-        return [idx for idx, t in nodes_on_edge]
+        return self.mesh_obj.get_nodes_on_edge(pt1, pt2, tol)
     
     def _set_boundary_conditions(self):
         """
-        Applies Dirichlet BC (fixing nodes with x ≈ 0) and redistributes Neumann BC (traction)
-        along edges by distributing the load to all nodes on the edge.
+        Applies Dirichlet BC (fixing nodes with x ≈ 0) 
+        and redistributes Neumann BC (traction) along edges.
         """
+        
+        self.K = self.K.tolil()
+        
         # Dirichlet: fix nodes with x near 0.
         fixed_nodes = [i for i, coord in enumerate(self.nodes) if abs(coord[0]) < 1e-8]
         for node in fixed_nodes:
@@ -616,6 +1191,7 @@ class FiniteElement:
         # Neumann: redistribute traction along edges.
         if self.tractions is not None:
             for key, bc in self.tractions.items():
+                
                 if 'edge' in bc:
                     edge_indices = bc['edge']
                     pt1 = self.nodes[edge_indices[0]]
@@ -642,6 +1218,7 @@ class FiniteElement:
                             
                             self.F[2*i1:2*i1+2] += force_segment
                             self.F[2*i2:2*i2+2] += force_segment
+                            
                     else:
                         i1, i2 = node_list
                         seg_length = np.linalg.norm(self.nodes[i2]-self.nodes[i1])
@@ -651,19 +1228,93 @@ class FiniteElement:
                         self.F[2*i2:2*i2+2] += force_segment
         
         if self.forces is not None:
+            
             for force in self.forces:
                 node = force['node']
                 self.F[2*node:2*node+2] += np.array(force['force'])
                 
+        self.K = self.K.tocsr()
+                
+    def _set_ref_boundary_conditions(self):
+        """
+        Apply Dirichlet and Neumann boundary conditions to the reference solution
+        in exactly the same way as _set_boundary_conditions(), but for the reference.
+        """
+        
+        self.K_ref = self.K_ref.tolil()
+        
+        # Dirichlet: fix nodes with x near 0.
+        fixed_nodes = [i for i, coord in enumerate(self.ref_nodes) if abs(coord[0]) < 1e-8]
+        for node in fixed_nodes:
+            for dof in [2*node, 2*node+1]:
+                self.K_ref[dof, :] = 0
+                self.K_ref[:, dof] = 0
+                self.K_ref[dof, dof] = 1
+                self.F_ref[dof] = 0.0
+                
+        # Neumann: redistribute traction along edges.
+        
+        if self.tractions is not None:
+            for key, bc in self.tractions.items():
+                if 'edge' in bc:
+                    edge_indices = bc['edge']
+                    pt1 = self.ref_nodes[edge_indices[0]]
+                    pt2 = self.ref_nodes[edge_indices[1]]
+                    sorted_nodes = self.ref_mesh_obj.get_nodes_on_edge(pt1, pt2)
+                
+                    for j in range(len(sorted_nodes) - 1):
+                        i1 = sorted_nodes[j]
+                        i2 = sorted_nodes[j+1]
+                        seg_length = np.linalg.norm(self.ref_nodes[i2] - self.ref_nodes[i1])
+                        force_segment = (seg_length * self.plane_thickness / 2.0) * np.array(bc['traction'])
+                    
+                        self.F_ref[2*i1:2*i1+2] += force_segment
+                        self.F_ref[2*i2:2*i2+2] += force_segment
+            
+                elif 'nodes' in bc:
+                    node_list = bc['nodes']
+                    if len(node_list) > 2:
+                        for j in range(len(node_list) - 1):
+                            i1 = node_list[j]
+                            i2 = node_list[j+1]
+                            seg_length = np.linalg.norm(self.ref_nodes[i2] - self.ref_nodes[i1])
+                            force_segment = (seg_length * self.plane_thickness / 2.0) * np.array(bc['traction'])
+                        
+                            self.F_ref[2*i1:2*i1+2] += force_segment
+                            self.F_ref[2*i2:2*i2+2] += force_segment
+                    else:
+
+                        i1, i2 = node_list
+                        seg_length = np.linalg.norm(self.ref_nodes[i2] - self.ref_nodes[i1])
+                        force_segment = (seg_length * self.plane_thickness / 2.0) * np.array(bc['traction'])
+                    
+                        self.F_ref[2*i1:2*i1+2] += force_segment
+                        self.F_ref[2*i2:2*i2+2] += force_segment
+                        
+        if self.forces is not None:
+            
+            for force in self.forces:
+                node = force['node']
+                self.F_ref[2*node:2*node+2] += np.array(force['force'])
+        
+        self.K_ref = self.K_ref.tocsr()
+                
     def solve_system(self):
+        """
+        Solve the system Ku = F for the displacement field u.
+        """
+        
         try:
             self.U = spla.spsolve(self.K, self.F)
         
         except np.linalg.LinAlgError as e:
             logging.error("Error solving system: " + str(e))
-            raise e
+            raise ValueError("Error solving system.")
         
     def compute_element_stress_strain(self, elem_idx):
+        """
+        Compute strain and stress in a single element at convenient evaluation points.
+        """
         
         nodes_idx = self.mesh_elements[elem_idx]
         coords = self.nodes[nodes_idx, :]
@@ -671,30 +1322,47 @@ class FiniteElement:
         dof_indices = []
         for n in nodes_idx:
             dof_indices.extend([2*n, 2*n+1])
-        U_e = self.U[dof_indices]
-       
-        x1, y1 = coords[0]
-        x2, y2 = coords[1]
-        x3, y3 = coords[2]
-        detJ = (x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)
-        A_e = 0.5 * abs(detJ)
-        
-        dN_dx = np.array([y2-y3, y3-y1, y1-y2])/(2*A_e)
-        dN_dy = np.array([x3-x2, x1-x3, x2-x1])/(2*A_e)
-        
-        B = np.zeros((3,6))
-        for i in range(3):
-            B[0,2*i] = dN_dx[i]
-            B[1,2*i+1] = dN_dy[i]
-            B[2,2*i] = dN_dy[i]
-            B[2,2*i+1] = dN_dx[i]
             
-        strain = B.dot(U_e)
-        stress = self._constitutive_matrix().dot(strain)
+        U_e = self.U[dof_indices]
         
-        return strain, stress
+        quad_rule = self.mesh_obj.get_quadrature(order=3)
+        
+        strain_sum = np.zeros(3)
+        stress_sum = np.zeros(3)
+        weight_sum = 0.0
+        
+        for (xi, eta), w in zip(quad_rule.points, quad_rule.weights):
+
+            B, detJ = self.mesh_obj.compute_B_matrix(elem_idx, xi, eta)
+
+            if abs(detJ) < 1e-14:
+                continue
+
+            strain_pt = B @ U_e
+            stress_pt = self._constitutive_matrix() @ strain_pt
+
+            # Weighted accumulation 
+            dW = w * abs(detJ) * self.plane_thickness
+            strain_sum += strain_pt * dW
+            stress_sum += stress_pt * dW
+            weight_sum += dW
+
+        if weight_sum < 1e-14:
+        
+            logging.warning(f"Element {elem_idx}: zero or near-zero integrated weight.")
+            raise ValueError(f"Element {elem_idx}: zero or near-zero integrated weight.")
+        
+        else:
+            strain_avg = strain_sum / weight_sum
+            stress_avg = stress_sum / weight_sum
+
+        return strain_avg, stress_avg
     
     def compute_reference_element_stress_strain(self, elem_idx):
+        """
+        Compute strain/stress for the reference solution's element #elem_idx,
+        using the separate reference mesh and U_ref.
+        """
         
         nodes_idx = self.ref_mesh_elements[elem_idx]
         coords = self.ref_nodes[nodes_idx, :]
@@ -705,26 +1373,38 @@ class FiniteElement:
             dof_indices.extend([2*n, 2*n+1])
         U_e = self.U_ref[dof_indices]
         
-        x1, y1 = coords[0]
-        x2, y2 = coords[1]
-        x3, y3 = coords[2]
-        detJ = (x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)
-        A_e = 0.5 * abs(detJ)
+        quad_rule = self.ref_mesh_obj.get_quadrature(order=3)
         
-        dN_dx = np.array([y2-y3, y3-y1, y1-y2])/(2*A_e)
-        dN_dy = np.array([x3-x2, x1-x3, x2-x1])/(2*A_e)
-        B = np.zeros((3,6))
+        strain_sum = np.zeros(3)
+        stress_sum = np.zeros(3)
+        weight_sum = 0.0
         
-        for i in range(3):
-            B[0,2*i] = dN_dx[i]
-            B[1,2*i+1] = dN_dy[i]
-            B[2,2*i] = dN_dy[i]
-            B[2,2*i+1] = dN_dx[i]
-            
-        strain = B.dot(U_e)
-        stress = self._constitutive_matrix().dot(strain)
+        for (xi, eta), w in zip(quad_rule.points, quad_rule.weights):
+
+            B, detJ = self.ref_mesh_obj.compute_B_matrix(elem_idx, xi, eta)
+
+            if abs(detJ) < 1e-14:
+                continue
+
+            strain_pt = B @ U_e
+            stress_pt = self._constitutive_matrix() @ strain_pt
+
+            # Weighted accumulation 
+            dW = w * abs(detJ) * self.plane_thickness
+            strain_sum += strain_pt * dW
+            stress_sum += stress_pt * dW
+            weight_sum += dW
+
+        if weight_sum < 1e-14:
         
-        return strain, stress
+            logging.warning(f"Element {elem_idx}: zero or near-zero integrated weight.")
+            raise ValueError(f"Element {elem_idx}: zero or near-zero integrated weight.")
+        
+        else:
+            strain_avg = strain_sum / weight_sum
+            stress_avg = stress_sum / weight_sum
+
+        return strain_avg, stress_avg
     
     def _adaptive_refinement(self, tol=0.01, max_iter=10):
         """
@@ -755,7 +1435,8 @@ class FiniteElement:
         self.ref_tree = cKDTree(ref_centroids)
         self.ref_stresses = ref_stresses
 
-        quad = Dunavant(4)
+        quad = self.mesh_obj.get_quadrature(order=3)
+
         stagnant_iterations = 0
         prev_num_elements = self.num_elements
 
@@ -764,7 +1445,7 @@ class FiniteElement:
             element_errors = []
             
             for i in range(self.num_elements):
-                integrated_error, integrated_ref_stress, A_e = self._integrated_stress_error(i, quad)
+                integrated_error, integrated_ref_stress, A_e = self._integrated_stress_error(i)
                 rel_err = integrated_error / (integrated_ref_stress + 1e-8)
                 element_errors.append(rel_err)
                 
@@ -810,74 +1491,104 @@ class FiniteElement:
             self._set_boundary_conditions()
             self.solve_system()
             
-    def _integrated_stress_error(self, elem_idx, quad_rule):
-        
+    def _integrated_stress_error(self, elem_idx):
+        """
+        Compute the L²-like stress error in element 'elem_idx' by evaluating
+        the stress at a single centroid.
+
+        Args:
+            elem_idx   : index of the current element in self.mesh_elements
+            quad_rule  : not really used here anymore, but left in the signature for compatibility
+
+        Returns:
+            integrated_error      : "integrated" error measure for this element
+            integrated_ref_stress : "integrated" reference stress measure
+            area_e                : the element's area (or area-equivalent in 2D)
+        """
+
         nodes_idx = self.mesh_elements[elem_idx]
         coords = self.nodes[nodes_idx, :]
         
-        x1, y1 = coords[0]
-        x2, y2 = coords[1]
-        x3, y3 = coords[2]
-        detJ = (x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)
-        A_e = 0.5 * abs(detJ)
-        
-        _, stress_comp = self.compute_element_stress_strain(elem_idx)
-        
-        error_sq = 0.0
-        ref_stress_sq = 0.0
-        
-        for (xi, eta), w in zip(quad_rule.points, quad_rule.weights):
-            L1, L2 = xi, eta
-            L3 = 1 - xi - eta
+        quad = self.mesh_obj.get_quadrature(order=1)
+        xi, eta = quad.points[0]
             
-            x = L1*x1 + L2*x2 + L3*x3
-            y = L1*y1 + L2*y2 + L3*y3
-            
-            dist, idx = self.ref_tree.query([x, y])
-            stress_ref = self.ref_stresses[idx]
-            
-            err = np.linalg.norm(stress_comp - stress_ref)
-            error_sq += w * err**2
-            ref_stress_sq += w * (np.linalg.norm(stress_ref))**2
-            
-        integrated_error = np.sqrt(error_sq) * (2*A_e)
-        integrated_ref_stress = np.sqrt(ref_stress_sq) * (2*A_e)
+        B, detJ = self.mesh_obj.compute_B_matrix(elem_idx, xi, eta)
         
+        dof_indices = []
+        for n in nodes_idx:
+            dof_indices.extend([2*n, 2*n+1])
+                
+        U_e = self.U[dof_indices]
+            
+        strain_pt = B @ U_e
+        stress_pt = self._constitutive_matrix() @ strain_pt
+        
+        if self.mesh_type == "triangular":
+            A_e = 0.5 * abs(detJ)
+        else:
+            A_e = abs(detJ)
+            
+        N, _ = self.mesh_obj.shape_funcs(xi, eta)
+        x = np.dot(N, coords[:, 0])
+        y = np.dot(N, coords[:, 1])
+
+        # Query KD-tree for nearest reference centroid
+        dist, idx = self.ref_tree.query([x, y])
+        stress_ref = self.ref_stresses[idx]
+
+        # Compute difference in stress and multiply by area to get integrated measure
+        err = np.linalg.norm(stress_pt - stress_ref)
+        ref_norm = np.linalg.norm(stress_ref)
+
+        integrated_error = err * A_e
+        integrated_ref_stress = ref_norm * A_e
+
         return integrated_error, integrated_ref_stress, A_e
             
     def generate_reference_solution(self, ref_max_volume):
         """
         Generate a high-fidelity reference solution using a very fine mesh.
         """
-        self._generate_mesh(max_volume=ref_max_volume)
-        self.plot_mesh()
+        if self.mesh_type == 'triangular':
+            self.ref_mesh_obj = TriMesh(self.domain, max_volume=ref_max_volume)
+            
+        elif self.mesh_type == 'quadrilateral':
+            self.ref_mesh_obj = QuadMesh(self.domain, Nx=self.Nx, Ny=self.Ny)
+            
+        else:
+            raise ValueError(f"Unsupported mesh type: {self.mesh_type}")
+    
+        self.ref_mesh_obj.generate_mesh(ref_max_volume)
         
-        self._assemble_global_stiffness()
-        self.F = np.zeros(2*self.num_nodes)
-        self._set_boundary_conditions()
-        self.solve_system()
+        self.ref_nodes = self.ref_mesh_obj.nodes.copy()
+        self.ref_mesh_elements = self.ref_mesh_obj.mesh_elements.copy()
         
-        self.ref_nodes = self.nodes.copy()
-        self.ref_mesh_elements = self.mesh_elements.copy()
-        self.U_ref = self.U.copy()
+        self.plot_ref_mesh()
+        
+        self._assemble_reference_stiffness()
+        self.F_ref = np.zeros(2 * self.ref_nodes.shape[0])
+        self._set_ref_boundary_conditions()
+        self.U_ref = spla.spsolve(self.K_ref, self.F_ref)
         
         stresses = []
-        for i in range(self.num_elements):
-            _, stress = self.compute_element_stress_strain(i)
+        for i in range(self.ref_num_elements):
+            _, stress = self.compute_reference_element_stress_strain(i)
             stresses.append(stress)
             
         self.Stress_ref = np.array(stresses)
         self.plot_stress_field_ref(component=0)
         self.plot_stress_field_ref(component=1)
-        logging.info(f"Reference solution generated with {self.num_elements} elements.")
+        logging.info(f"Reference solution generated with {self.ref_num_elements} elements.")
         
     def run_analysis(self, ref_max_volume=0.01, tol_stress=0.01, max_iterations=10):
         """
         Run the finite element analysis with adaptive refinement.
         """
+        
         self.generate_reference_solution(ref_max_volume)
+    
         self._generate_mesh(max_volume=self.max_volume)
-        #self.plot_mesh()
+        self.plot_mesh()
         
         self._assemble_global_stiffness()
         self.F = np.zeros(2*self.num_nodes)
@@ -907,6 +1618,16 @@ class FiniteElement:
         plt.figure()
         plt.triplot(triang, 'k-', lw=0.5)
         plt.title('Finite Element Mesh')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+        
+    def plot_ref_mesh(self):
+        
+        triang = tri.Triangulation(self.ref_nodes[:, 0], self.ref_nodes[:, 1], triangles=self.ref_mesh_elements)
+        plt.figure()
+        plt.triplot(triang, 'k-', lw=0.5)
+        plt.title('Reference Mesh')
         plt.xlabel('x')
         plt.ylabel('y')
         plt.show()
@@ -994,8 +1715,8 @@ class FiniteElement:
         triang_orig = tri.Triangulation(self.nodes[:,0], self.nodes[:,1], triangles=self.mesh_elements)
         triang_def = tri.Triangulation(deformed_nodes[:,0], deformed_nodes[:,1], triangles=self.mesh_elements)
         plt.figure()
-        plt.triplot(triang_orig, color='lightgray', linestyle='--', label='Original mesh')
         plt.triplot(triang_def, color='blue', lw=1.5, label='Deformed mesh')
+        plt.triplot(triang_orig, color='lightgray', linestyle='--', label='Original mesh')
         plt.title("Nodal Displacement (deformed mesh)")
         plt.xlabel("x")
         plt.ylabel("y")
@@ -1015,7 +1736,7 @@ class FiniteElement:
         
         self.plot_nodal_displacement(scale=scale)
         
-#%%
+#%% # Example Usage
 
 E = 4.4e7 # Pa
 nu = 0.37
@@ -1050,9 +1771,9 @@ tractions = {
         }
     }
 
-fe_solver = FiniteElement()
+fe_solver = FiniteElement(mesh_type="triangular")
 
-fe_solver._set_system_params(domain, tractions, E, nu, thickness, 0.1)
+fe_solver._set_system_params(domain, E, nu, thickness, tractions=tractions, init_vol=0.1)
 
 fe_solver.run_analysis(ref_max_volume=1e-4, tol_stress=0.01, max_iterations=20)
 
