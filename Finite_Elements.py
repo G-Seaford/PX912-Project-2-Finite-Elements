@@ -1204,12 +1204,22 @@ class FiniteElement:
         
         # Dirichlet: fix nodes with x near 0.
         fixed_nodes = [i for i, coord in enumerate(self.nodes) if abs(coord[0]) < 1e-8]
+        
+        corner_node = fixed_nodes[0]
+        
         for node in fixed_nodes:
-            for dof in [2*node, 2*node+1]:
+            if node == corner_node:
+                for dof in [2*node, 2*node+1]:
+                    self.K[dof, :] = 0
+                    self.K[:, dof] = 0
+                    self.K[dof, dof] = 1
+                    self.F[dof] = 0.0
+            else:
+                dof = 2 * node
                 self.K[dof, :] = 0
                 self.K[:, dof] = 0
                 self.K[dof, dof] = 1
-                self.F[dof] = 0
+                self.F[dof] = 0.0
         
         # Neumann: redistribute traction along edges.
         if self.tractions is not None:
@@ -1268,8 +1278,17 @@ class FiniteElement:
         
         # Dirichlet: fix nodes with x near 0.
         fixed_nodes = [i for i, coord in enumerate(self.ref_nodes) if abs(coord[0]) < 1e-8]
+        corner_node = fixed_nodes[0]
+        
         for node in fixed_nodes:
-            for dof in [2*node, 2*node+1]:
+            if node == corner_node:
+                for dof in [2*node, 2*node+1]:
+                    self.K_ref[dof, :] = 0
+                    self.K_ref[:, dof] = 0
+                    self.K_ref[dof, dof] = 1
+                    self.F_ref[dof] = 0.0
+            else:
+                dof = 2 * node
                 self.K_ref[dof, :] = 0
                 self.K_ref[:, dof] = 0
                 self.K_ref[dof, dof] = 1
@@ -1394,7 +1413,7 @@ class FiniteElement:
             dof_indices.extend([2*n, 2*n+1])
         U_e = self.U_ref[dof_indices]
         
-        quad_rule = self.ref_mesh_obj.get_quadrature(order=5)
+        quad_rule = self.ref_mesh_obj.get_quadrature(order=8)
         
         strain_sum = np.zeros(3)
         stress_sum = np.zeros(3)
@@ -1456,7 +1475,7 @@ class FiniteElement:
         self.ref_tree = cKDTree(ref_centroids)
         self.ref_stresses = ref_stresses
 
-        quad = self.mesh_obj.get_quadrature(order=3)
+        quad = self.mesh_obj.get_quadrature(order=4)
 
         stagnant_iterations = 0
         prev_num_elements = self.num_elements
@@ -1467,7 +1486,7 @@ class FiniteElement:
             
             for i in range(self.num_elements):
                 integrated_error, integrated_ref_stress, A_e = self._integrated_stress_error(i)
-                rel_err = integrated_error / (integrated_ref_stress + 1e-8)
+                rel_err = np.sqrt(integrated_error) / (np.sqrt(integrated_ref_stress) + 1e-8)
                 element_errors.append(rel_err)
                 
                 if rel_err > tol:
@@ -1515,7 +1534,7 @@ class FiniteElement:
     def _integrated_stress_error(self, elem_idx):
         """
         Compute the L²-like stress error in element 'elem_idx' by evaluating
-        the stress at a single centroid.
+        the stress at quadrature points.
 
         Args:
             elem_idx   : index of the current element in self.mesh_elements
@@ -1528,43 +1547,54 @@ class FiniteElement:
         """
 
         nodes_idx = self.mesh_elements[elem_idx]
-        coords = self.nodes[nodes_idx, :]
-        
-        quad = self.mesh_obj.get_quadrature(order=1)
-        xi, eta = quad.points[0]
-            
-        B, detJ = self.mesh_obj.compute_B_matrix(elem_idx, xi, eta)
+        coords = self.nodes[nodes_idx]
         
         dof_indices = []
+        
         for n in nodes_idx:
             dof_indices.extend([2*n, 2*n+1])
-                
         U_e = self.U[dof_indices]
-            
-        strain_pt = B @ U_e
-        stress_pt = self._constitutive_matrix() @ strain_pt
         
-        if self.mesh_type == "triangular":
-            A_e = 0.5 * abs(detJ)
-        else:
-            A_e = abs(detJ)
+        quad = self.mesh_obj.get_quadrature(order=4)
+        
+        error_integral = 0.0
+        ref_integral = 0.0
+        
+        for i, (xi, eta) in enumerate(quad.points):
+            w = quad.weights[i]
             
-        N, _ = self.mesh_obj.shape_funcs(xi, eta)
-        x = np.dot(N, coords[:, 0])
-        y = np.dot(N, coords[:, 1])
+            B, detJ = self.mesh_obj.compute_B_matrix(elem_idx, xi, eta)
+            
+            strain_main = B @ U_e
+            stress_main = self._constitutive_matrix() @ strain_main
+            
+            # Approximate reference stress
+            N, _ = self.mesh_obj.shape_funcs(xi, eta)
+            x = np.dot(N, coords[:, 0])
+            y = np.dot(N, coords[:, 1])
+            
+            # Query nearest reference centroid from KD-tree
+            dist, idx_ref = self.ref_tree.query([x, y])
+            stress_ref = self.ref_stresses[idx_ref]
+            
+            diff = stress_main - stress_ref
+            
+            if self.mesh_type == "triangular":
+                A_e = 0.5 * abs(detJ) * w
+                
+            else:
+                A_e = abs(detJ) * w
+        
+            diff_sq = np.dot(diff, diff)
+            ref_sq = np.dot(stress_ref, stress_ref)
+        
+            error_integral += diff_sq * A_e
+            ref_integral += ref_sq * A_e
+            
+        error_integral *= self.plane_thickness
+        ref_integral *= self.plane_thickness
 
-        # Query KD-tree for nearest reference centroid
-        dist, idx = self.ref_tree.query([x, y])
-        stress_ref = self.ref_stresses[idx]
-
-        # Compute difference in stress and multiply by area to get integrated measure
-        err = np.linalg.norm(stress_pt - stress_ref)
-        ref_norm = np.linalg.norm(stress_ref)
-
-        integrated_error = err * A_e
-        integrated_ref_stress = ref_norm * A_e
-
-        return integrated_error, integrated_ref_stress, A_e
+        return error_integral, ref_integral, A_e
             
     def generate_reference_solution(self, ref_max_volume):
         """
@@ -1597,8 +1627,8 @@ class FiniteElement:
             stresses.append(stress)
             
         self.Stress_ref = np.array(stresses)
-        self.plot_stress_field_ref(component=0)
-        self.plot_stress_field_ref(component=1)
+        
+
         logging.info(f"Reference solution generated with {self.ref_num_elements} elements.")
         
     def run_analysis(self, ref_max_volume=0.01, tol_stress=0.01, max_iterations=10):
@@ -1634,7 +1664,6 @@ class FiniteElement:
         self.Stress = np.array(stresses)
             
     def plot_mesh(self):
-        
         triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], triangles=self.mesh_elements)
         plt.figure()
         plt.triplot(triang, 'k-', lw=0.5)
@@ -1652,71 +1681,235 @@ class FiniteElement:
         plt.xlabel('x')
         plt.ylabel('y')
         plt.show()
+        
+    def plot_stress_field(self):
+        """
+        Plot three subplots of the stress field:
+          - σ_xx
+          - σ_yy
+          - σ_xy
+        with a shared colour bar.
+        """
+        
+        # Label for each stress component
+        comp_labels = [r'$S_{xx}$', r'$S_{yy}$', r'$S_{xy}$']
+        n_components = 3
     
-    def plot_stress_field(self, component=0):
+        fig, axes = plt.subplots(1, n_components, figsize=(16, 5), sharex=True, sharey=True, constrained_layout=True)
+    
+        # Precompute nodal stress fields for each component
+        nodal_stress_fields = []
+        for comp in range(n_components):
         
-        dims = ['x', 'y']
-        num_nodes = self.nodes.shape[0]
-        stress_sum = np.zeros(num_nodes)
-        count = np.zeros(num_nodes)
+            # Allocate array to accumulate stress values
+            stress_sum = np.zeros(self.num_nodes)
+            count = np.zeros(self.num_nodes)
         
-        for i, elem in enumerate(self.mesh_elements):
-            for n in elem:
-                stress_sum[n] += self.Stress[i, component]
-                count[n] += 1
-        nodal_stress = stress_sum / np.maximum(count, 1)
+            # Accumulate element-based stresses into nodal arrays
+            for i, elem in enumerate(self.mesh_elements):
+                for n in elem:
+                    stress_sum[n] += self.Stress[i, comp]
+                    count[n] += 1
         
-        triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], triangles=self.mesh_elements)
-        plt.figure()
-        tpc = plt.tripcolor(triang, nodal_stress, edgecolors='k', shading='gouraud', cmap='viridis')
-        plt.colorbar(tpc, label=f'Stress component (Pa)')
-        plt.title(f'Stress Field in {dims[component]}-direction with Gouraud shading')
-        plt.xlabel('x')
-        plt.ylabel('y')
+            # Avoid division by zero
+            nodal_stress = stress_sum / np.maximum(count, 1)
+            nodal_stress_fields.append(nodal_stress)
+    
+        # Determine a global min/max so all subplots share the same colour scale
+        vmin = min(field.min() for field in nodal_stress_fields)
+        vmax = max(field.max() for field in nodal_stress_fields)
+    
+        # Build a triangulation once
+        triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], self.mesh_elements)
+    
+        # Plot each component in its own subplot
+        mappables = []
+        for comp_idx in range(n_components):
+            ax = axes[comp_idx]
+            tpc = ax.tripcolor(triang, nodal_stress_fields[comp_idx], vmin=vmin, 
+                vmax=vmax, edgecolors='k', shading='gouraud', cmap='viridis')
+
+            ax.set_title(f"Stress: {comp_labels[comp_idx]}")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            mappables.append(tpc)
+    
+        # Add a single colour bar for all subplots
+        cbar = fig.colorbar(mappables[0], ax=axes.ravel().tolist())
+        cbar.set_label("Stress (Pa)")
+    
         plt.show()
         
-    def plot_stress_field_ref(self, component=0):
+    def plot_stress_field_ref(self):
+        """
+        Plot three subplots of the reference stress field:
+          - σ_xx
+          - σ_yy
+          - σ_xy
+        with a shared colour bar.
+        """
         
-        dims = ['x', 'y']
-        num_nodes = self.ref_nodes.shape[0]
-        stress_sum = np.zeros(num_nodes)
-        count = np.zeros(num_nodes)
+        # Label for each stress component
+        comp_labels = [r'$S_{xx}$', r'$S_{yy}$', r'$S_{xy}$']
+        n_components = 3
+    
+        fig, axes = plt.subplots(1, n_components, figsize=(16, 5), sharex=True, sharey=True, constrained_layout=True)
+    
+        # Precompute nodal stress fields for each component
+        nodal_stress_fields = []
+        for comp in range(n_components):
         
-        for i, elem in enumerate(self.ref_mesh_elements):
-            for n in elem:
-                stress_sum[n] += self.Stress_ref[i, component]
-                count[n] += 1
-        nodal_stress = stress_sum / np.maximum(count, 1)
+            # Allocate array to accumulate stress values
+            stress_sum = np.zeros(self.ref_num_nodes)
+            count = np.zeros(self.ref_num_nodes)
         
-        triang = tri.Triangulation(self.ref_nodes[:, 0], self.ref_nodes[:, 1], triangles=self.ref_mesh_elements)
-        plt.figure()
-        tpc = plt.tripcolor(triang, nodal_stress, edgecolors='k', shading='gouraud', cmap='viridis')
-        plt.colorbar(tpc, label=f'Stress component (Pa)')
-        plt.title(f'Reference Stress Field in {dims[component]}-direction')
-        plt.xlabel('x')
-        plt.ylabel('y')
+            # Accumulate element-based stresses into nodal arrays
+            for i, elem in enumerate(self.ref_mesh_elements):
+                for n in elem:
+                    stress_sum[n] += self.Stress_ref[i, comp]
+                    count[n] += 1
+        
+            # Avoid division by zero
+            nodal_stress = stress_sum / np.maximum(count, 1)
+            nodal_stress_fields.append(nodal_stress)
+    
+        # Determine a global min/max so all subplots share the same colour scale
+        vmin = min(field.min() for field in nodal_stress_fields)
+        vmax = max(field.max() for field in nodal_stress_fields)
+    
+        # Build a triangulation once
+        triang = tri.Triangulation(self.ref_nodes[:, 0], self.ref_nodes[:, 1], self.ref_mesh_elements)
+    
+        # Plot each component in its own subplot
+        mappables = []
+        for comp_idx in range(n_components):
+            ax = axes[comp_idx]
+            tpc = ax.tripcolor(triang, nodal_stress_fields[comp_idx], vmin=vmin, 
+                vmax=vmax, edgecolors='k', shading='gouraud', cmap='viridis')
+
+            ax.set_title(f"Reference Stress: {comp_labels[comp_idx]}")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            mappables.append(tpc)
+    
+        # Add a single colour bar for all subplots
+        cbar = fig.colorbar(mappables[0], ax=axes.ravel().tolist())
+        cbar.set_label("Stress (Pa)")
+    
+        plt.show()
+    
+    def plot_strain_field(self):
+        """
+        Plot three subplots of the strain field:
+          - ε_xx
+          - ε_yy
+          - ε_xy
+        with a shared colour bar.
+        """
+        # Label for each strain component
+        comp_labels = [r'$\varepsilon_{xx}$', r'$\varepsilon_{yy}$', r'$\varepsilon_{xy}$']
+        n_components = 3
+    
+        fig, axes = plt.subplots(1, n_components, figsize=(16, 5), sharex=True, sharey=True, constrained_layout=True)
+
+        # Precompute nodal strain fields for each component
+        nodal_strain_fields = []
+        for comp in range(n_components):
+        
+            # Allocate array to accumulate strain values
+            strain_sum = np.zeros(self.num_nodes)
+            count = np.zeros(self.num_nodes)
+        
+            # Accumulate element-based strains into nodal arrays
+            for i, elem in enumerate(self.mesh_elements):
+                for n in elem:
+                    strain_sum[n] += self.Strain[i, comp]
+                    count[n] += 1
+        
+            # Avoid division by zero
+            nodal_strain = strain_sum / np.maximum(count, 1)
+            nodal_strain_fields.append(nodal_strain)
+    
+        # Determine a global min/max so all subplots share the same colour scale
+        vmin = min(field.min() for field in nodal_strain_fields)
+        vmax = max(field.max() for field in nodal_strain_fields)
+    
+        # Build a triangulation once
+        triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], self.mesh_elements)
+    
+        # Plot each component in its own subplot
+        mappables = []
+        for comp_idx in range(n_components):
+            ax = axes[comp_idx]
+            tpc = ax.tripcolor(triang, nodal_strain_fields[comp_idx], vmin=vmin, 
+                vmax=vmax, edgecolors='k', shading='gouraud', cmap='viridis')
+        
+            ax.set_title(f"Strain: {comp_labels[comp_idx]}")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            mappables.append(tpc)
+    
+        # Add a single colour bar for all subplots
+        cbar = fig.colorbar(mappables[0], ax=axes.ravel().tolist())
+        cbar.set_label("Strain")
+    
         plt.show()
         
-    def plot_strain_field(self, component=0):
+    def plot_strain_field_ref(self):
+        """
+        Plot three subplots of the reference strain field:
+          - ε_xx
+          - ε_yy
+          - ε_xy
+        with a shared colour bar.
+        """
+        # Label for each strain component
+        comp_labels = [r'$\varepsilon_{xx}$', r'$\varepsilon_{yy}$', r'$\varepsilon_{xy}$']
+        n_components = 3
+    
+        fig, axes = plt.subplots(1, n_components, figsize=(16, 5), sharex=True, sharey=True, constrained_layout=True)
+
+        # Precompute nodal strain fields for each component
+        nodal_strain_fields = []
+        for comp in range(n_components):
         
-        dims = ['x', 'y']
-        num_nodes = self.nodes.shape[0]
-        strain_sum = np.zeros(num_nodes)
-        count = np.zeros(num_nodes)
+            # Allocate array to accumulate strain values
+            strain_sum = np.zeros(self.ref_num_nodes)
+            count = np.zeros(self.ref_num_nodes)
         
-        for i, elem in enumerate(self.mesh_elements):
-            for n in elem:
-                strain_sum[n] += self.Strain[i, component]
-                count[n] += 1
-        nodal_strain = strain_sum / np.maximum(count, 1)
+            # Accumulate element-based strains into nodal arrays
+            for i, elem in enumerate(self.ref_mesh_elements):
+                for n in elem:
+                    strain_sum[n] += self.Strain_ref[i, comp]
+                    count[n] += 1
         
-        triang = tri.Triangulation(self.nodes[:, 0], self.nodes[:, 1], triangles=self.mesh_elements)
-        plt.figure()
-        tpc = plt.tripcolor(triang, nodal_strain, edgecolors='k', shading='gouraud', cmap='viridis')
-        plt.colorbar(tpc, label='Strain component')
-        plt.title(f'Strain Field in {dims[component]}-direction with Gouraud shading')
-        plt.xlabel('x')
-        plt.ylabel('y')
+            # Avoid division by zero
+            nodal_strain = strain_sum / np.maximum(count, 1)
+            nodal_strain_fields.append(nodal_strain)
+    
+        # Determine a global min/max so all subplots share the same colour scale
+        vmin = min(field.min() for field in nodal_strain_fields)
+        vmax = max(field.max() for field in nodal_strain_fields)
+    
+        # Build a triangulation once
+        triang = tri.Triangulation(self.ref_nodes[:, 0], self.ref_nodes[:, 1], self.ref_mesh_elements)
+    
+        # Plot each component in its own subplot
+        mappables = []
+        for comp_idx in range(n_components):
+            ax = axes[comp_idx]
+            tpc = ax.tripcolor(triang, nodal_strain_fields[comp_idx], vmin=vmin, 
+                vmax=vmax, edgecolors='k', shading='gouraud', cmap='viridis')
+        
+            ax.set_title(f"Reference Strain: {comp_labels[comp_idx]}")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            mappables.append(tpc)
+    
+        # Add a single colour bar for all subplots
+        cbar = fig.colorbar(mappables[0], ax=axes.ravel().tolist())
+        cbar.set_label("Strain")
+    
         plt.show()
         
     def plot_convergence(self):
@@ -1749,12 +1942,9 @@ class FiniteElement:
         
         self.plot_convergence()
         
-        self.plot_stress_field(component=0)
-        self.plot_stress_field(component=1)
-        
-        self.plot_strain_field(component=0)
-        self.plot_strain_field(component=1)
-        
+        self.plot_stress_field()
+        self.plot_strain_field()
+
         self.plot_nodal_displacement(scale=scale)
         
 #%% # Example Usage
@@ -1799,7 +1989,5 @@ fe_solver._set_system_params(domain, E, nu, thickness, tractions=tractions, init
 fe_solver.run_analysis(ref_max_volume=4e-5, tol_stress=0.01, max_iterations=20)
 
 fe_solver.plot_data()
-
-fe_solver.K.shape
 
 # %%
